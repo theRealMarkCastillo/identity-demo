@@ -77,7 +77,7 @@ def admin_dashboard(request: Request):
         """)
         tokens = [
             {
-                "jti_short": r[0][:12] + "...",
+                "jti_short": str(r[0])[:12] + "...",
                 "sub": r[1], "act_sub": r[2], "client_id": r[3],
                 "scope": r[4], "exp": r[5], "created_at": r[6],
             }
