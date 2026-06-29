@@ -103,6 +103,29 @@ Tokens are RS256-signed JWTs. The web app fetches the control plane's public key
 - No shared secret between the web app and the control plane. Only the control plane holds the private key.
 - JWTs carry structured claims (`sub`, `scope`, `act`, `jti`) that every layer can read without a network round-trip.
 
+### Why JWT at all? (vs opaque, PASETO, sessions)
+
+JWT is a choice, not a given. The realistic alternatives are:
+
+| Token format | What it is | What it costs | When to pick it |
+|---|---|---|---|
+| **JWT** (we use this) | Self-contained, signed. Verifiable locally with the issuer's public key. | Can't revoke instantly (signature still valid until `exp`). Larger (~200B). Claims are visible to the token-holder (signed, not encrypted). | Distributed verification needed; resource servers can't reach the AS on every request. |
+| **Opaque tokens + introspection** (RFC 7662) | Random string. Resource server calls `POST /oauth/introspect` to learn the claims. | Every request needs a callback to the AS (or a cache). The AS is a hot-path dependency. | Instant revocation matters more than latency. Claims must be hidden from the client. |
+| **PASETO** | Like JWT but designed to fix JWT's footguns (no `alg:none`, no algorithm confusion, encrypted by default). | Smaller ecosystem. Fewer libraries. No `jwt.io`-equivalent inspector. | Greenfield systems that don't need JWT ecosystem interop. |
+| **Stateful session cookies** | Random ID, server looks up the session in a DB/Redis. | The session store becomes the trust anchor. Multi-region gets complicated. State doesn't compose well across services. | Single-server web apps. No inter-service verification. |
+
+**Why JWT for this demo specifically:** the demo's whole thesis is "identity flows cryptographically to the data layer." That *requires* the database itself to verify tokens — no callback, no trust assumption. JWT is the only format that lets the DB verify locally with the issuer's public key. With opaque tokens, the DB would have to call the control plane on every query, which re-introduces the trust assumption the demo is trying to eliminate.
+
+**When production picks differently:**
+- **High-stakes revocation** (financial, healthcare) → opaque + introspection. The latency cost is worth instant kill.
+- **Claims contain PII** → opaque (or JWE-encrypted JWT, much rarer).
+- **Greenfield + security paranoid** → PASETO. Avoids the entire JWT algorithm-confusion attack class.
+- **Single web app, no internal APIs** → session cookies. Why involve tokens at all?
+
+**The "split the world" pattern** (what mature systems actually do): use both. JWT for service-to-service calls where latency matters. Opaque + introspection for high-security endpoints where revocation matters. Session cookies for browser-to-web-app. Each tool used where it fits — the "JWT vs opaque" debate is a false dichotomy in production.
+
+See FAQ §9 for a shorter version of this comparison.
+
 ### Postgres RLS via GUCs (`SET LOCAL`) — identity into the database
 
 The core identity propagation pattern: the application sets Postgres session variables (`SET LOCAL app.user_id, app.actor_id`) before executing queries, and RLS policies read those variables to enforce row-level access:
@@ -602,7 +625,7 @@ A: Because the delegated agent is *neither* — it acts on behalf of a user (so 
 ### Technical
 
 **Q: Why JWTs and not opaque tokens?**
-A: JWTs are self-contained. The database (or any service) can verify them locally with the public key from JWKS — no network callback to the control plane. Opaque tokens are random strings that require an introspection call to the AS on every request, which would mean the database trusts whatever the control plane says at request time. JWTs make identity *cryptographically verifiable*, not *trusted*.
+A: JWTs are self-contained. The database (or any service) can verify them locally with the public key from JWKS — no network callback to the control plane. Opaque tokens are random strings that require an introspection call to the AS on every request, which would mean the database trusts whatever the control plane says at request time. JWTs make identity *cryptographically verifiable*, not *trusted*. The deeper trade-off — JWT vs opaque vs PASETO vs sessions, and when each is right — is covered in §3 ("Why JWT at all?"). The short version: this demo needs the *database* to verify tokens locally, which forces JWT. Production systems often run *both* — JWT for service-to-service, opaque + introspection where instant revocation matters, sessions for browser-only.
 
 **Q: Why scopes and not roles directly in the token?**
 A: Scopes are fine-grained permissions (`read:transactions`, `write:transactions`). Roles are *bundles* of scopes (`senior_analyst` = R+W). Putting scopes in the token — and roles in a database table — lets you do scope intersection cleanly during token exchange (`effective = subject.scopes ∩ agent.default_scopes`, see §7.2) without re-issuing tokens when role definitions change.
