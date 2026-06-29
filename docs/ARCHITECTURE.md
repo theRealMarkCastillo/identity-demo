@@ -276,6 +276,66 @@ USING (
 
 Even if all three were bypassed, the database itself rejects unauthorized actions.
 
+### Policy catalog: where every authorization decision is defined
+
+This sub-section is the **map to the source of truth** for every "who can do what" rule in the system. If you're trying to answer "where is this policy defined?" or "what do I change to allow X?" — start here.
+
+#### Layer 1: RLS policies (SQL, in `db/init.sql`)
+
+The row-level access logic is in SQL because the database is the last line of defense. RLS policies are **DDL** — changing them requires `make reset` (rebuilds the DB from `init.sql`).
+
+| Policy | Location | What it enforces |
+|---|---|---|
+| `select_policy` | `db/init.sql:218` | SELECT for any principal type, scoped by `current_user_id()` / `current_actor_id()` |
+| `modify_human_only` | `db/init.sql:234` | INSERT/UPDATE/DELETE only when `current_actor_id() IS NULL` — agents can never write |
+
+Both policies read `current_user_id()` and `current_actor_id()` — helper functions defined earlier in `init.sql` that wrap `current_setting('app.user_id')` and `current_setting('app.actor_id')`.
+
+#### Layer 2: Role and agent scope data (rows in `platform.*` tables)
+
+The mapping from "role/agent" → "allowed scopes" is **data**, not code. Changing these tables takes effect on the next token issuance — no restart, no redeploy.
+
+| Table | Location | What it stores |
+|---|---|---|
+| `platform.roles` | `db/init.sql:35` (DDL), `:46` (seed) | Role catalog: `senior_analyst`, `junior_analyst`, `auditor` |
+| `platform.role_scopes` | `db/init.sql:40` (DDL), `:51` (seed) | Role → scope rows: `senior_analyst` → R+W, `junior_analyst` → R, `auditor` → R |
+| `platform.agents` | `db/init.sql:105` (DDL) | Agent catalog with `default_scopes TEXT[]` column — what scope an agent gets by default during delegation |
+| `platform.clients` | `db/init.sql` (DDL) | OAuth client registry (web app + headless agents) with per-client `allowed_scopes` |
+
+#### Layer 3: Scope computation (Python services in the control plane)
+
+The control plane reads the data tables above and computes the **effective scope** for each token issuance. This is **code**, not data — changing it requires redeploying the control plane.
+
+| File | Function | What it does |
+|---|---|---|
+| `control-plane/app/services/roles.py:7` | `get_role_scopes(role)` | Reads `platform.role_scopes` for a role |
+| `control-plane/app/services/roles.py:17` | `compute_effective_scopes(role, requested)` | `role_scopes ∩ requested` — the downscope formula for human users |
+| `control-plane/app/services/agents.py` | `get_agent(agent_id)` | Reads `platform.agents.default_scopes` for token exchange |
+| `control-plane/app/routes/token.py` | grant handlers | Calls the above at issuance time for all four grant types |
+
+#### The "what do I change to allow X?" cheat sheet
+
+| If you want to… | Edit… | Redeploy needed? |
+|---|---|---|
+| Add a new role (e.g., `contractor`) | `INSERT INTO platform.roles` + rows in `platform.role_scopes` | No — picked up on next token issuance |
+| Change what an existing role can do | `UPDATE/INSERT/DELETE` on `platform.role_scopes` | No |
+| Add a new agent | `INSERT INTO platform.agents (agent_id, default_scopes, is_delegatable)` | No |
+| Change what an agent gets by default | `UPDATE platform.agents SET default_scopes = ...` | No |
+| Add a new scope string (e.g., `delete:transactions`) | 1) New RLS policy in `db/init.sql` <br> 2) Add to `platform.role_scopes` for human roles <br> 3) Add to `platform.agents.default_scopes` for agents <br> 4) Add to web app's tool definitions | **Yes** for (1) and (4) — `make reset` + web app redeploy. (2) and (3) are data changes. |
+| Change the downscope formula | `control-plane/app/services/roles.py` | **Yes** — control plane redeploy |
+| Change who can write at all | `db/init.sql` `modify_human_only` policy | **Yes** — `make reset` |
+| Revoke all tokens for a user | `UPDATE platform.token_records SET revoked=TRUE WHERE sub=...` | No — takes effect on next request |
+
+#### Why this split?
+
+This is **policy-as-data + policy-as-code**, deliberately:
+
+- **Roles and agent defaults are data** because business changes frequently ("junior analyst gets read-only of shared rows too"). Data changes ship in seconds via SQL, no engineering ticket.
+- **RLS policies are code** because they're security-critical and changing them should require a code review, a schema migration, and a rebuild. You don't want a junior engineer changing `modify_human_only` via a UI.
+- **Scope computation is code** because it's the trust boundary — the `effective = subject.scopes ∩ agent.scopes` line is *the* delegation-safety invariant. It deserves the rigor of a code review.
+
+The trade-off: the "what changes require what" matrix above is the operational cost. In production you'd add policy-as-code tools (OPA, Cedar) and a CI check that flags `platform.role_scopes` changes without an accompanying change ticket.
+
 ## 7. OAuth Flows (Sequence)
 
 The diagrams below use [Mermaid](https://mermaid.js.org/), which GitHub renders natively.
