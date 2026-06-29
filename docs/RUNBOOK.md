@@ -310,11 +310,16 @@ Browse to **`http://localhost:13000/admin`** after logging in. The dashboard sho
 - **Agents** — registered agents with `default_scopes` and `is_delegatable` flag
 - **OAuth clients** — `client_id`, `client_type`, whether a secret is set, allowed scopes
 - **Column masking policies** — `platform.column_policies` rows (table, column, mask, params, min scope, description)
+- **Active tokens** — count + top 10 by `created_at` (principal/actor/scope/exp)
 - **Delegation activity (24h)** — which agents are being delegated to, and how often
-- **Recent active tokens** — top 10 by `created_at`, with principal/actor/scope/exp
 - **Admin history** — recent `admin_*` rows from `platform.audit_log` (every cli-admin write)
 
 This page is **strictly read-only**. It uses the web app's existing `app_session` DB role, which only has `SELECT` on `platform.roles/role_scopes/agents/clients/column_policies`. No CSRF tokens are issued because nothing is written.
+
+**Live updates.** The dashboard polls `/api/admin-data` every 10 seconds and re-renders each panel in place, so changes made via `cli-admin` in another terminal show up without a manual reload. The header has:
+- **`↻ Refresh now`** — immediate re-fetch
+- **`Last refreshed: HH:MM:SS`** stamp + a small green/red dot that turns red and surfaces the error in the header if the auto-refresh fails (so a transient DB blip is visible)
+- All panel `*tbody` ids are stable for the JS to update in place; SSR provides the first paint so the page is meaningful even if JS fails to load
 
 ### CLI admin tool
 

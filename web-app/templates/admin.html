@@ -17,16 +17,38 @@
     table { width: 100%; border-collapse: collapse; font-size: 12px; }
     th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #334155; }
     th { color: #94a3b8; font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; }
-    td code { background: #0f172a; padding: 1px 5px; border-radius: 3px; color: #cbd5e1; font-size: 11px; }
+    td code { background: #0f172a; padding: 1px 5px; border-radius: 3px; color: #cbd5e1; font-size: 11px; word-break: break-word; }
     .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; }
     .badge.yes { background: #064e3b; color: #6ee7b7; }
     .badge.no  { background: #7f1d1d; color: #fca5a5; }
     .badge.user_app { background: #1e3a8a; color: #93c5fd; }
     .badge.agent    { background: #78350f; color: #fcd34d; }
+    .badge.mask-full    { background: #7f1d1d; color: #fca5a5; }
+    .badge.mask-partial { background: #1e3a8a; color: #93c5fd; }
+    .badge.mask-hash    { background: #78350f; color: #fcd34d; }
+    .badge.mask-null    { background: #4b5563; color: #d1d5db; }
     .stat { display: inline-block; margin-right: 16px; }
     .stat .k { color: #94a3b8; font-size: 10px; text-transform: uppercase; }
     .stat .v { color: #fbbf24; font-size: 18px; font-weight: 600; font-family: monospace; }
     .muted { color: #64748b; font-style: italic; }
+    .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .actions .btn {
+      padding: 6px 12px; background: #2563eb; color: #fff;
+      border: none; font-size: 12px; cursor: pointer; border-radius: 4px;
+    }
+    .actions .btn:hover { background: #1d4ed8; }
+    .actions .stamp {
+      color: #94a3b8; font-size: 11px; font-family: monospace;
+    }
+    .live-dot {
+      display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+      background: #34d399; margin-right: 6px;
+    }
+    .details-cell {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px; color: #94a3b8; max-width: 540px;
+      white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;
+    }
   </style>
 </head>
 <body>
@@ -38,13 +60,21 @@
     · <a href="/dashboard">← back to demo dashboard</a>
   </div>
 
+  <div class="actions" style="margin-bottom: 20px;">
+    <button id="refresh-btn" class="btn" onclick="refreshAdmin(true)">↻ Refresh now</button>
+    <span class="stamp">
+      <span id="live-dot" class="live-dot"></span>
+      Last refreshed: <span id="last-refreshed">just now</span> · auto-refresh every 10s
+    </span>
+    <span class="stamp" id="error-stamp" style="color:#f87171;"></span>
+  </div>
+
   <div class="grid">
     <div class="card">
-      <h2>Roles ({{ roles|length }})</h2>
-      {% if roles %}
+      <h2>Roles (<span id="roles-count">{{ roles|length }}</span>)</h2>
       <table>
         <thead><tr><th>Role</th><th>Scopes</th><th>Description</th></tr></thead>
-        <tbody>
+        <tbody id="roles-tbody">
           {% for r in roles %}
           <tr>
             <td><code>{{ r.role }}</code></td>
@@ -54,15 +84,14 @@
           {% endfor %}
         </tbody>
       </table>
-      {% else %}<p class="muted">No roles registered.</p>{% endif %}
+      <p id="roles-empty" class="muted" style="display:none;">No roles registered.</p>
     </div>
 
     <div class="card">
-      <h2>Agents ({{ agents|length }})</h2>
-      {% if agents %}
+      <h2>Agents (<span id="agents-count">{{ agents|length }}</span>)</h2>
       <table>
         <thead><tr><th>Agent ID</th><th>Delegatable</th><th>Default Scopes</th></tr></thead>
-        <tbody>
+        <tbody id="agents-tbody">
           {% for a in agents %}
           <tr>
             <td><code>{{ a.agent_id }}</code></td>
@@ -72,17 +101,16 @@
           {% endfor %}
         </tbody>
       </table>
-      {% else %}<p class="muted">No agents registered.</p>{% endif %}
+      <p id="agents-empty" class="muted" style="display:none;">No agents registered.</p>
     </div>
   </div>
 
   <div class="grid">
     <div class="card">
-      <h2>OAuth Clients ({{ clients|length }})</h2>
-      {% if clients %}
+      <h2>OAuth Clients (<span id="clients-count">{{ clients|length }}</span>)</h2>
       <table>
         <thead><tr><th>Client ID</th><th>Type</th><th>Secret</th><th>Allowed Scopes</th></tr></thead>
-        <tbody>
+        <tbody id="clients-tbody">
           {% for c in clients %}
           <tr>
             <td><code>{{ c.client_id }}</code></td>
@@ -93,20 +121,19 @@
           {% endfor %}
         </tbody>
       </table>
-      {% else %}<p class="muted">No clients registered.</p>{% endif %}
+      <p id="clients-empty" class="muted" style="display:none;">No clients registered.</p>
     </div>
 
     <div class="card">
-      <h2>Column Masking Policies ({{ column_policies|length }})</h2>
-      {% if column_policies %}
+      <h2>Column Masking Policies (<span id="policies-count">{{ column_policies|length }}</span>)</h2>
       <table>
         <thead><tr><th>Table</th><th>Column</th><th>Mask</th><th>Params</th><th>Min scope (raw)</th><th>Description</th></tr></thead>
-        <tbody>
+        <tbody id="policies-tbody">
           {% for p in column_policies %}
           <tr>
             <td><code>{{ p.table_name }}</code></td>
             <td><code>{{ p.column_name }}</code></td>
-            <td><span class="badge" style="background:#7f1d1d; color:#fca5a5;">{{ p.mask_type }}</span></td>
+            <td><span class="badge mask-{{ p.mask_type }}">{{ p.mask_type }}</span></td>
             <td><code style="font-size:10px;">{{ p.mask_params or '—' }}</code></td>
             <td><code>{{ p.min_scope }}</code></td>
             <td style="font-size:11px; color:#94a3b8;">{{ p.description or '' }}</td>
@@ -114,64 +141,233 @@
           {% endfor %}
         </tbody>
       </table>
-      {% else %}<p class="muted">No column policies registered.</p>{% endif %}
+      <p id="policies-empty" class="muted" style="display:none;">No column policies registered.</p>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Active Tokens (top 10)</h2>
+      <div style="margin-bottom: 10px;">
+        <div class="stat"><div class="k">Active count</div><div class="v" id="active-count">{{ active_count }}</div></div>
+      </div>
+      <table>
+        <thead><tr><th>jti</th><th>sub (principal)</th><th>act (actor)</th><th>client</th><th>scope</th><th>expires</th></tr></thead>
+        <tbody id="tokens-tbody">
+          {% for t in tokens %}
+          <tr>
+            <td><code>{{ t.jti_short }}</code></td>
+            <td><code>{{ t.sub }}</code></td>
+            <td>{% if t.act_sub %}<code>{{ t.act_sub }}</code>{% else %}<span class="muted">—</span>{% endif %}</td>
+            <td><code>{{ t.client_id }}</code></td>
+            <td><code>{{ t.scope }}</code></td>
+            <td><code>{{ t.exp.strftime('%Y-%m-%d %H:%M') }}</code></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <p id="tokens-empty" class="muted" style="display:none;">No active tokens.</p>
     </div>
 
     <div class="card">
       <h2>Delegation Activity (24h)</h2>
-      <div style="margin-bottom: 10px;">
-        <div class="stat"><div class="k">Active tokens</div><div class="v">{{ active_count }}</div></div>
-      </div>
-      {% if usage_24h %}
       <table>
         <thead><tr><th>Agent</th><th>Token exchanges</th></tr></thead>
-        <tbody>
+        <tbody id="usage-tbody">
           {% for u in usage_24h %}
           <tr><td><code>{{ u.actor }}</code></td><td>{{ u.count }}</td></tr>
           {% endfor %}
         </tbody>
       </table>
-      {% else %}<p class="muted">No token exchanges in the last 24h.</p>{% endif %}
+      <p id="usage-empty" class="muted" style="display:none;">No token exchanges in the last 24h.</p>
     </div>
   </div>
 
   <div class="card full">
-    <h2>Recent Active Tokens (top 10)</h2>
-    {% if tokens %}
-    <table>
-      <thead><tr><th>jti</th><th>sub (principal)</th><th>act (actor)</th><th>client</th><th>scope</th><th>expires</th></tr></thead>
-      <tbody>
-        {% for t in tokens %}
-        <tr>
-          <td><code>{{ t.jti_short }}</code></td>
-          <td><code>{{ t.sub }}</code></td>
-          <td>{% if t.act_sub %}<code>{{ t.act_sub }}</code>{% else %}<span class="muted">—</span>{% endif %}</td>
-          <td><code>{{ t.client_id }}</code></td>
-          <td><code>{{ t.scope }}</code></td>
-          <td><code>{{ t.exp.strftime('%Y-%m-%d %H:%M') }}</code></td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    {% else %}<p class="muted">No active tokens.</p>{% endif %}
-  </div>
-
-  <div class="card full">
     <h2>Admin History (cli-admin actions)</h2>
-    {% if admin_history %}
     <table>
       <thead><tr><th>Time</th><th>Action</th><th>Details</th></tr></thead>
-      <tbody>
+      <tbody id="history-tbody">
         {% for h in admin_history %}
         <tr>
           <td><code>{{ h.ts.strftime('%Y-%m-%d %H:%M:%S') }}</code></td>
           <td><code>{{ h.event_type }}</code></td>
-          <td><code style="font-size: 11px; color: #94a3b8;">{{ h.details }}</code></td>
+          <td><code class="details-cell">{{ h.details }}</code></td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
-    {% else %}<p class="muted">No admin actions yet. Run <code>./cli-admin/admin.py role list</code> on the host to get started.</p>{% endif %}
+    <p id="history-empty" class="muted" style="display:none;">No admin actions yet. Run <code>./cli-admin/admin.py role list</code> on the host to get started.</p>
   </div>
+
+  <script>
+    // ===========================================================================
+    // Live refresh for /admin
+    // ===========================================================================
+    // Every panel re-renders in place from /api/admin-data. 10s polling +
+    // manual refresh. Initial SSR ensures the dashboard is meaningful even if
+    // JS fails to load.
+
+    function esc(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+    function codes(items) {
+      if (!items || !items.length) return '<span class="muted">(none)</span>';
+      return items.map(s => `<code>${esc(s)}</code>`).join(' ');
+    }
+    function iso_to_dt(s) {
+      if (!s) return '—';
+      try {
+        const d = new Date(s);
+        const p = n => String(n).padStart(2, '0');
+        return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+      } catch (e) { return s; }
+    }
+    function iso_to_full(s) {
+      if (!s) return '—';
+      try { return new Date(s).toLocaleString(); }
+      catch (e) { return s; }
+    }
+
+    function renderRoles(rows) {
+      const tbody = document.getElementById('roles-tbody');
+      const empty = document.getElementById('roles-empty');
+      document.getElementById('roles-count').textContent = String(rows.length);
+      tbody.innerHTML = rows.map(r => `
+        <tr>
+          <td><code>${esc(r.role)}</code></td>
+          <td>${codes(r.scopes)}</td>
+          <td>${esc(r.description)}</td>
+        </tr>
+      `).join('') || '<tr><td colspan="3"></td></tr>';
+      empty.style.display = rows.length ? 'none' : 'block';
+      tbody.style.display = rows.length ? '' : 'none';
+    }
+
+    function renderAgents(rows) {
+      const tbody = document.getElementById('agents-tbody');
+      const empty = document.getElementById('agents-empty');
+      document.getElementById('agents-count').textContent = String(rows.length);
+      tbody.innerHTML = rows.map(a => `
+        <tr>
+          <td><code>${esc(a.agent_id)}</code></td>
+          <td>${a.is_delegatable ? '<span class="badge yes">yes</span>' : '<span class="badge no">no</span>'}</td>
+          <td>${codes(a.default_scopes)}</td>
+        </tr>
+      `).join('');
+      empty.style.display = rows.length ? 'none' : 'block';
+      tbody.style.display = rows.length ? '' : 'none';
+    }
+
+    function renderClients(rows) {
+      const tbody = document.getElementById('clients-tbody');
+      const empty = document.getElementById('clients-empty');
+      document.getElementById('clients-count').textContent = String(rows.length);
+      tbody.innerHTML = rows.map(c => `
+        <tr>
+          <td><code>${esc(c.client_id)}</code></td>
+          <td><span class="badge ${esc(c.client_type)}">${esc(c.client_type || '-')}</span></td>
+          <td>${c.has_secret ? '<span class="badge yes">set</span>' : '<span class="badge no">none</span>'}</td>
+          <td>${codes(c.allowed_scopes)}</td>
+        </tr>
+      `).join('');
+      empty.style.display = rows.length ? 'none' : 'block';
+      tbody.style.display = rows.length ? '' : 'none';
+    }
+
+    function renderPolicies(rows) {
+      const tbody = document.getElementById('policies-tbody');
+      const empty = document.getElementById('policies-empty');
+      document.getElementById('policies-count').textContent = String(rows.length);
+      tbody.innerHTML = rows.map(p => `
+        <tr>
+          <td><code>${esc(p.table_name)}</code></td>
+          <td><code>${esc(p.column_name)}</code></td>
+          <td><span class="badge mask-${esc(p.mask_type)}">${esc(p.mask_type)}</span></td>
+          <td><code style="font-size:10px;">${esc(p.mask_params || '—')}</code></td>
+          <td><code>${esc(p.min_scope)}</code></td>
+          <td style="font-size:11px; color:#94a3b8;">${esc(p.description || '')}</td>
+        </tr>
+      `).join('');
+      empty.style.display = rows.length ? 'none' : 'block';
+      tbody.style.display = rows.length ? '' : 'none';
+    }
+
+    function renderTokens(rows, activeCount) {
+      const tbody = document.getElementById('tokens-tbody');
+      const empty = document.getElementById('tokens-empty');
+      document.getElementById('active-count').textContent = String(activeCount);
+      tbody.innerHTML = rows.map(t => `
+        <tr>
+          <td><code>${esc(t.jti_short)}</code></td>
+          <td><code>${esc(t.sub)}</code></td>
+          <td>${t.act_sub ? `<code>${esc(t.act_sub)}</code>` : '<span class="muted">—</span>'}</td>
+          <td><code>${esc(t.client_id)}</code></td>
+          <td><code>${esc(t.scope)}</code></td>
+          <td><code>${esc(iso_to_dt(t.exp))}</code></td>
+        </tr>
+      `).join('');
+      empty.style.display = rows.length ? 'none' : 'block';
+      tbody.style.display = rows.length ? '' : 'none';
+    }
+
+    function renderUsage(rows) {
+      const tbody = document.getElementById('usage-tbody');
+      const empty = document.getElementById('usage-empty');
+      tbody.innerHTML = rows.map(u => `
+        <tr><td><code>${esc(u.actor)}</code></td><td>${esc(u.count)}</td></tr>
+      `).join('');
+      empty.style.display = rows.length ? 'none' : 'block';
+      tbody.style.display = rows.length ? '' : 'none';
+    }
+
+    function renderHistory(rows) {
+      const tbody = document.getElementById('history-tbody');
+      const empty = document.getElementById('history-empty');
+      tbody.innerHTML = rows.map(h => `
+        <tr>
+          <td><code>${esc(iso_to_full(h.ts))}</code></td>
+          <td><code>${esc(h.event_type)}</code></td>
+          <td><code class="details-cell">${esc(h.details || '')}</code></td>
+        </tr>
+      `).join('');
+      empty.style.display = rows.length ? 'none' : 'block';
+      tbody.style.display = rows.length ? '' : 'none';
+    }
+
+    function paintAll(data) {
+      renderRoles(data.roles || []);
+      renderAgents(data.agents || []);
+      renderClients(data.clients || []);
+      renderPolicies(data.column_policies || []);
+      renderTokens(data.tokens || [], data.active_count || 0);
+      renderUsage(data.usage_24h || []);
+      renderHistory(data.admin_history || []);
+    }
+
+    async function refreshAdmin(manual = false) {
+      const stamp = document.getElementById('last-refreshed');
+      const dot   = document.getElementById('live-dot');
+      const err   = document.getElementById('error-stamp');
+      err.textContent = '';
+      try {
+        const r = await fetch('/api/admin-data', { cache: 'no-store' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const data = await r.json();
+        paintAll(data);
+        stamp.textContent = new Date().toLocaleTimeString();
+        dot.style.background = '#34d399';
+      } catch (e) {
+        stamp.textContent = 'failed';
+        dot.style.background = '#f87171';
+        err.textContent = manual ? `Refresh failed: ${e.message}` : ' (auto-refresh failed)';
+      }
+    }
+
+    refreshAdmin();                     // initial paint from JS (overwrites SSR render with the same data)
+    setInterval(() => refreshAdmin(false), 10000);
+  </script>
 </body>
 </html>
