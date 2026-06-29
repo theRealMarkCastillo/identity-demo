@@ -876,7 +876,8 @@ The demo's value isn't the custom control plane — it's the **end-to-end identi
 │       ├── session.py           # itsdangerous session + CSRF
 │       └── routes/
 │           ├── ui.py            # /login, /callback, /dashboard
-│           └── actions.py       # /action/*, /chat/*, /api/*, /revoke/*
+│           ├── actions.py       # /action/*, /chat/*, /api/*, /revoke/*
+│           └── admin.py         # /admin (read-only dashboard for roles/agents/clients/tokens)
 ├── cli-agent/                   # Headless OAuth 2.1 client
 │   ├── README.md
 │   ├── requirements.txt
@@ -884,6 +885,10 @@ The demo's value isn't the custom control plane — it's the **end-to-end identi
 │   ├── llm.py                   # OpenAI tool-calling (mirrors web-app)
 │   ├── tools.py                 # Direct DB access (as app_session)
 │   └── config.py
+├── cli-admin/                   # CLI for managing platform.* tables
+│   ├── README.md
+│   ├── requirements.txt
+│   └── admin.py                 # role/agent/client/token subcommands; writes to audit_log
 ├── scripts/
 │   ├── gen_keys.py              # RS256 keypair
 │   └── seed_passwords.py        # BCrypt hash helper

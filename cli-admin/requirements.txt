@@ -1,0 +1,3 @@
+# CLI Admin Tool - Manage Roles, Agents, Clients, Tokens
+psycopg[binary]==3.2.3
+bcrypt==4.2.1

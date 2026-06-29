@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Identity Demo - Admin (Read-Only)</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 24px; background: #0f172a; color: #e2e8f0; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: #94a3b8; margin: 0 0 8px; }
+    .sub { color: #94a3b8; font-size: 12px; margin-bottom: 20px; line-height: 1.5; }
+    .sub code { background: #1e293b; padding: 2px 5px; border-radius: 3px; color: #fbbf24; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+    .card { background: #1e293b; border-radius: 6px; padding: 16px; border: 1px solid #334155; overflow-x: auto; }
+    .card.full { grid-column: 1 / -1; }
+    a { color: #60a5fa; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #334155; }
+    th { color: #94a3b8; font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; }
+    td code { background: #0f172a; padding: 1px 5px; border-radius: 3px; color: #cbd5e1; font-size: 11px; }
+    .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; }
+    .badge.yes { background: #064e3b; color: #6ee7b7; }
+    .badge.no  { background: #7f1d1d; color: #fca5a5; }
+    .badge.user_app { background: #1e3a8a; color: #93c5fd; }
+    .badge.agent    { background: #78350f; color: #fcd34d; }
+    .stat { display: inline-block; margin-right: 16px; }
+    .stat .k { color: #94a3b8; font-size: 10px; text-transform: uppercase; }
+    .stat .v { color: #fbbf24; font-size: 18px; font-weight: 600; font-family: monospace; }
+    .muted { color: #64748b; font-style: italic; }
+  </style>
+</head>
+<body>
+  <h1>Admin Dashboard <span style="font-size:12px; color:#94a3b8;">(read-only)</span></h1>
+  <div class="sub">
+    Source of truth: Postgres <code>platform.*</code> tables. To change anything, use
+    <code>./cli-admin/admin.py</code> on the host (or <code>docker compose run --rm web-app python -m ...</code>).
+    See <code>cli-admin/README.md</code> and <code>make admin-help</code>.
+    · <a href="/dashboard">← back to demo dashboard</a>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Roles ({{ roles|length }})</h2>
+      {% if roles %}
+      <table>
+        <thead><tr><th>Role</th><th>Scopes</th><th>Description</th></tr></thead>
+        <tbody>
+          {% for r in roles %}
+          <tr>
+            <td><code>{{ r.role }}</code></td>
+            <td>{% for s in r.scopes %}<code>{{ s }}</code> {% endfor %}{% if not r.scopes %}<span class="muted">(none)</span>{% endif %}</td>
+            <td>{{ r.description }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<p class="muted">No roles registered.</p>{% endif %}
+    </div>
+
+    <div class="card">
+      <h2>Agents ({{ agents|length }})</h2>
+      {% if agents %}
+      <table>
+        <thead><tr><th>Agent ID</th><th>Delegatable</th><th>Default Scopes</th></tr></thead>
+        <tbody>
+          {% for a in agents %}
+          <tr>
+            <td><code>{{ a.agent_id }}</code></td>
+            <td>{% if a.is_delegatable %}<span class="badge yes">yes</span>{% else %}<span class="badge no">no</span>{% endif %}</td>
+            <td>{% for s in a.default_scopes %}<code>{{ s }}</code> {% endfor %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<p class="muted">No agents registered.</p>{% endif %}
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>OAuth Clients ({{ clients|length }})</h2>
+      {% if clients %}
+      <table>
+        <thead><tr><th>Client ID</th><th>Type</th><th>Secret</th><th>Allowed Scopes</th></tr></thead>
+        <tbody>
+          {% for c in clients %}
+          <tr>
+            <td><code>{{ c.client_id }}</code></td>
+            <td><span class="badge {{ c.client_type }}">{{ c.client_type or '-' }}</span></td>
+            <td>{% if c.has_secret %}<span class="badge yes">set</span>{% else %}<span class="badge no">none</span>{% endif %}</td>
+            <td>{% for s in c.allowed_scopes %}<code>{{ s }}</code> {% endfor %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<p class="muted">No clients registered.</p>{% endif %}
+    </div>
+
+    <div class="card">
+      <h2>Delegation Activity (24h)</h2>
+      <div style="margin-bottom: 10px;">
+        <div class="stat"><div class="k">Active tokens</div><div class="v">{{ active_count }}</div></div>
+      </div>
+      {% if usage_24h %}
+      <table>
+        <thead><tr><th>Agent</th><th>Token exchanges</th></tr></thead>
+        <tbody>
+          {% for u in usage_24h %}
+          <tr><td><code>{{ u.actor }}</code></td><td>{{ u.count }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<p class="muted">No token exchanges in the last 24h.</p>{% endif %}
+    </div>
+  </div>
+
+  <div class="card full">
+    <h2>Recent Active Tokens (top 10)</h2>
+    {% if tokens %}
+    <table>
+      <thead><tr><th>jti</th><th>sub (principal)</th><th>act (actor)</th><th>client</th><th>scope</th><th>expires</th></tr></thead>
+      <tbody>
+        {% for t in tokens %}
+        <tr>
+          <td><code>{{ t.jti_short }}</code></td>
+          <td><code>{{ t.sub }}</code></td>
+          <td>{% if t.act_sub %}<code>{{ t.act_sub }}</code>{% else %}<span class="muted">—</span>{% endif %}</td>
+          <td><code>{{ t.client_id }}</code></td>
+          <td><code>{{ t.scope }}</code></td>
+          <td><code>{{ t.exp.strftime('%Y-%m-%d %H:%M') }}</code></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}<p class="muted">No active tokens.</p>{% endif %}
+  </div>
+
+  <div class="card full">
+    <h2>Admin History (cli-admin actions)</h2>
+    {% if admin_history %}
+    <table>
+      <thead><tr><th>Time</th><th>Action</th><th>Details</th></tr></thead>
+      <tbody>
+        {% for h in admin_history %}
+        <tr>
+          <td><code>{{ h.ts.strftime('%Y-%m-%d %H:%M:%S') }}</code></td>
+          <td><code>{{ h.event_type }}</code></td>
+          <td><code style="font-size: 11px; color: #94a3b8;">{{ h.details }}</code></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}<p class="muted">No admin actions yet. Run <code>./cli-admin/admin.py role list</code> on the host to get started.</p>{% endif %}
+  </div>
+</body>
+</html>

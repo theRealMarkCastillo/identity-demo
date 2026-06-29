@@ -210,6 +210,8 @@ If you want to understand how each piece is built, the files below are the entry
 | How the web app propagates identity to the DB | `web-app/app/db.py` | The `run_with_identity()` helper — see how `SET LOCAL app.user_id, app.actor_id` is called per-transaction. |
 | How an LLM tool call ends up in RLS | `web-app/app/tools.py` | Each tool is a function that opens a connection, sets the GUCs, and runs a query. The DB enforces the rest. |
 | How the headless agent authenticates | `cli-agent/agent.py` | Calls `/oauth/token` with HTTP Basic auth + `grant_type=client_credentials`. No human in the loop. |
+| The read-only admin dashboard | `web-app/app/routes/admin.py` + `web-app/templates/admin.html` | Browse roles/agents/clients/active tokens without write access. |
+| How to manage policies from the CLI | `cli-admin/admin.py` | Thin Python wrapper over `platform.*` tables. Every write logs to `platform.audit_log`. See `cli-admin/README.md`. |
 | The complete delegation flow (diagram) | `docs/ARCHITECTURE.md` §3 (RFC 8693 section) | The "Why these standards" section explains the design rationale end-to-end. |
 
 **The most rewarding 5-minute deep dive:**
@@ -224,6 +226,78 @@ If you want to understand how each piece is built, the files below are the entry
    ORDER BY ts DESC LIMIT 5;
    ```
    The `act_sub` column shows which agent tried to do what — this is the audit trail that distinguishes "user did it" from "user's agent did it."
+
+## 6b. Managing Policies, Agents, and Tokens
+
+The demo ships with two complementary tools for operating on `platform.*` tables.
+
+### Read-only dashboard (web UI)
+
+Browse to **`http://localhost:13000/admin`** after logging in. The dashboard shows:
+
+- **Roles** — table of `platform.roles` × `platform.role_scopes` (role, scopes, description)
+- **Agents** — registered agents with `default_scopes` and `is_delegatable` flag
+- **OAuth clients** — `client_id`, `client_type`, whether a secret is set, allowed scopes
+- **Delegation activity (24h)** — which agents are being delegated to, and how often
+- **Recent active tokens** — top 10 by `created_at`, with principal/actor/scope/exp
+- **Admin history** — recent `admin_*` rows from `platform.audit_log` (every cli-admin write)
+
+This page is **strictly read-only**. It uses the web app's existing `app_session` DB role, which only has `SELECT` on `platform.roles/role_scopes/agents/clients`. No CSRF tokens are issued because nothing is written.
+
+### CLI admin tool
+
+For changes, use `cli-admin/admin.py` (or `make admin ARGS=...`). It connects as `control_plane_admin` (SUPERUSER) and writes a row to `platform.audit_log` for every change.
+
+```bash
+# Get help
+make admin-help
+./cli-admin/admin.py --help
+./cli-admin/admin.py role --help
+
+# Roles
+make admin ARGS="role list"
+make admin ARGS="role add contractor 'Read-only access to own rows'"
+make admin ARGS="role grant contractor read:transactions"
+make admin ARGS="role revoke contractor read:transactions"
+make admin ARGS="role delete contractor"
+
+# Agents
+make admin ARGS="agent list"
+make admin ARGS="agent add agent_data_analyst --scopes read:transactions --delegatable"
+make admin ARGS="agent update agent_data_analyst --scopes read:transactions,read:reports"
+make admin ARGS="agent delete agent_data_analyst"
+
+# Clients (rotate a leaked secret)
+make admin ARGS="client list"
+make admin ARGS="client rotate-secret web-app"   # prints new secret once
+
+# Tokens (operational cleanup)
+make admin ARGS="token list --active-only --limit 20"
+make admin ARGS="token list --sub user_123"
+make admin ARGS="token revoke <jti>"
+make admin ARGS="token revoke-all --sub user_456"
+make admin ARGS="token revoke-all --client-id web-app"
+```
+
+Required env: `CONTROL_PLANE_DB_PASSWORD` (matches `.env`). Optional: `DB_HOST`, `DB_PORT`, `DB_NAME`, `ADMIN_DB_USER` (defaults shown in `admin.py`).
+
+**Every write is auditable.** Verify by running:
+
+```sql
+SELECT ts, event_type, details
+FROM platform.audit_log
+WHERE event_type LIKE 'admin_%'
+ORDER BY ts DESC LIMIT 20;
+```
+
+### Why a CLI and not a web UI for writes?
+
+- **Source of truth stays in the DB** — the CLI is a thin SQL wrapper, not a stateful layer.
+- **No new web attack surface** — no auth, CSRF, or XSS surface to test.
+- **Scriptable** — pipe into `jq`, run from CI/CD, chain with `&&`.
+- **Auditable by design** — every write goes through `audit_log`.
+
+For visual inspection, use the dashboard. For changes, use the CLI.
 
 ## 7. Reset & Cleanup
 
