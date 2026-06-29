@@ -1,0 +1,83 @@
+# --- Environment / secrets ---
+.env
+.env.local
+.env.*.local
+
+# --- Generated signing keys (NEVER commit) ---
+control-plane/keys/*.pem
+control-plane/keys/*.key
+!control-plane/keys/.gitkeep
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+env.bak/
+venv.bak/
+.idea/
+.mypy_cache/
+.ruff_cache/
+
+# --- Test / coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.cache
+coverage.xml
+*.cover
+.hypothesis/
+
+# --- Docker / compose ---
+docker-compose.override.yml
+*.log
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- OS ---
+.Trashes
+*.local
+
+# --- Local test artifacts ---
+test.db
+test.sqlite
+*.bak
+*.tmp
+*.orig
+
+# --- Postgres data dumps (if anyone exports) ---
+*.dump
+*.pgdump

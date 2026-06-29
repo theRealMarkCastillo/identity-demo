@@ -1,0 +1,98 @@
+name: identity-demo
+
+services:
+  identity-db:
+    image: postgres:16-alpine
+    container_name: identity-db
+    environment:
+      POSTGRES_DB: identity
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+      CONTROL_PLANE_DB_PASSWORD: ${CONTROL_PLANE_DB_PASSWORD}
+      WEB_APP_REDIRECT_URI: ${WEB_APP_REDIRECT_URI}
+    ports:
+      - "54321:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d identity"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - identity-net
+
+  control-plane:
+    build:
+      context: ./control-plane
+    container_name: control-plane
+    environment:
+      DB_HOST: identity-db
+      DB_PORT: 5432
+      DB_NAME: identity
+      DB_USER: control_plane_admin
+      CONTROL_PLANE_DB_PASSWORD: ${CONTROL_PLANE_DB_PASSWORD}
+      CP_SIGNING_KEY_PATH: /keys/signing.pem
+      CP_JWT_TTL_SECONDS: ${CP_JWT_TTL_SECONDS:-3600}
+      CP_REFRESH_TTL_SECONDS: ${CP_REFRESH_TTL_SECONDS:-28800}
+      CP_PUBLIC_URL: ${CP_PUBLIC_URL}
+    ports:
+      - "18080:8080"
+    volumes:
+      - ./control-plane/keys:/keys:ro
+    depends_on:
+      identity-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - identity-net
+
+  web-app:
+    build:
+      context: ./web-app
+    container_name: web-app
+    environment:
+      CONTROL_PLANE_URL: http://control-plane:8080
+      CP_PUBLIC_URL: ${CP_PUBLIC_URL}
+      DB_HOST: identity-db
+      DB_PORT: 5432
+      DB_NAME: identity
+      DB_USER: app_session
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+      WEB_APP_CLIENT_ID: web-app
+      WEB_APP_CLIENT_SECRET: ${WEB_APP_CLIENT_SECRET}
+      WEB_APP_SESSION_SECRET: ${WEB_APP_SESSION_SECRET}
+      WEB_APP_REDIRECT_URI: ${WEB_APP_REDIRECT_URI}
+      FLASK_SECRET: ${FLASK_SECRET}
+      LLM_BASE_URL: ${LLM_BASE_URL}
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_MODEL: ${LLM_MODEL}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.3}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-500}
+      LLM_MAX_ITERATIONS: ${LLM_MAX_ITERATIONS:-5}
+    ports:
+      - "13000:3000"
+    depends_on:
+      identity-db:
+        condition: service_healthy
+      control-plane:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - identity-net
+
+volumes:
+  pgdata:
+
+networks:
+  identity-net:
+    driver: bridge

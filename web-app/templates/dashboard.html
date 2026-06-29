@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Identity Demo - Dashboard</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 24px; background: #0f172a; color: #e2e8f0; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; color: #94a3b8; margin: 0 0 8px; }
+    .sub { color: #94a3b8; font-size: 13px; margin-bottom: 24px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+    .card { background: #1e293b; border-radius: 6px; padding: 16px; border: 1px solid #334155; }
+    .card.full { grid-column: 1 / -1; }
+    pre { background: #0f172a; padding: 10px; border-radius: 4px; font-size: 11px; overflow-x: auto; color: #cbd5e1; max-height: 200px; overflow-y: auto; }
+    button { padding: 8px 12px; background: #2563eb; color: white; border: none; font-size: 12px; cursor: pointer; border-radius: 4px; margin-right: 6px; margin-top: 6px; }
+    button:hover { background: #1d4ed8; }
+    button.danger { background: #dc2626; }
+    button.danger:hover { background: #b91c1c; }
+    input[type=text] { width: 100%; padding: 8px; background: #0f172a; color: #e2e8f0; border: 1px solid #334155; border-radius: 4px; font-size: 13px; }
+    .row { display: flex; gap: 8px; }
+    .row > button { flex: 0 0 auto; }
+    .feed { font-size: 11px; max-height: 200px; overflow-y: auto; }
+    .feed-row { padding: 6px; border-bottom: 1px solid #334155; }
+    .feed-row .type { font-weight: 600; color: #fbbf24; }
+    .feed-row .type.rls_block { color: #f87171; }
+    .feed-row .type.token_issue, .feed-row .type.token_issue_principal=agent { color: #34d399; }
+    .feed-row .type.token_exchange { color: #60a5fa; }
+    .out { font-size: 11px; color: #cbd5e1; white-space: pre-wrap; }
+    .out.error { color: #fca5a5; }
+    .out.ok { color: #86efac; }
+    .principal-row { font-size: 12px; padding: 4px 0; }
+    .principal-row .k { color: #94a3b8; display: inline-block; width: 110px; }
+    .principal-row .v { color: #e2e8f0; font-family: monospace; }
+  </style>
+</head>
+<body>
+  <h1>Identity Demo Dashboard</h1>
+  <div class="sub">Signed in as <b>{{ user.sub }}</b> · scope: <code>{{ user.scope }}</code></div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>One-Click Demos</h2>
+      <button onclick="runAction('human-write')">Human: Update Row</button>
+      <button onclick="runAction('copilot-read')">Copilot: Read Own</button>
+      <button onclick="runAction('copilot-write')">Copilot: Try Update</button>
+      <button onclick="runAction('trigger-headless')">Headless: Trigger Run</button>
+      <div id="action-out" class="out" style="margin-top:12px;"></div>
+    </div>
+
+    <div class="card">
+      <h2>Current Principal</h2>
+      <div id="principal-panel" class="principal-row">Loading…</div>
+      <button class="danger" onclick="runRevoke('agent-token')">Revoke Agent Delegation</button>
+      <button class="danger" onclick="runRevoke('session')">Revoke My Session</button>
+    </div>
+  </div>
+
+  <div class="card full">
+    <h2>Chat with Copilot (LLM)</h2>
+    <div class="row">
+      <input id="chat-input" type="text" placeholder="Try: 'Update transaction #1 to 9999' or 'Show my transactions'">
+      <button onclick="sendChat()">Send</button>
+    </div>
+    <div id="chat-log" class="out" style="margin-top:12px; max-height:300px; overflow-y:auto;"></div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Human JWT</h2>
+      <pre>{{ human_jwt }}</pre>
+    </div>
+    <div class="card">
+      <h2>Agent JWT <span id="agent-jwt-status" style="color:#64748b">(none yet)</span></h2>
+      <pre id="agent-jwt-pre">{{ agent_jwt or "Run a Copilot action to mint an agent JWT" }}</pre>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Audit Feed</h2>
+      <div id="audit-feed" class="feed">Loading…</div>
+    </div>
+    <div class="card">
+      <h2>Background Agent (CLI)</h2>
+      <div id="headless-feed" class="feed">Run <code>make demo-headless</code> in another terminal to see the headless CLI agent in action.</div>
+    </div>
+  </div>
+
+  <form method="post" action="/logout" style="margin-top:16px;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit" class="danger">Logout</button>
+  </form>
+
+  <script>
+    const CSRF = "{{ csrf_token }}";
+
+    async function postForm(url, extra = {}) {
+      const fd = new FormData();
+      fd.append("csrf_token", CSRF);
+      for (const [k, v] of Object.entries(extra)) fd.append(k, v);
+      const r = await fetch(url, { method: "POST", body: fd });
+      return await r.json();
+    }
+
+    async function runAction(name) {
+      const out = document.getElementById("action-out");
+      out.textContent = "Running…";
+      out.className = "out";
+      try {
+        const r = await postForm(`/action/${name}`);
+        if (name === "copilot-read" || name === "headless") {
+          r.outcome = r.rows || r.outcome;
+        }
+        out.textContent = JSON.stringify(r, null, 2);
+        out.className = r.outcome && r.outcome.ok === false ? "out error" : "out ok";
+        if (r.agent_jwt) {
+          document.getElementById("agent-jwt-pre").textContent = r.agent_jwt;
+          document.getElementById("agent-jwt-status").textContent = "(active)";
+          document.getElementById("agent-jwt-status").style.color = "#34d399";
+        }
+        if (r.headless_claims) {
+          document.getElementById("agent-jwt-pre").textContent = "[headless agent JWT would be here; not shown in UI]";
+        }
+        refreshPrincipal();
+        refreshAudit();
+      } catch (e) {
+        out.textContent = "Error: " + e.message;
+        out.className = "out error";
+      }
+    }
+
+    async function sendChat() {
+      const input = document.getElementById("chat-input");
+      const msg = input.value.trim();
+      if (!msg) return;
+      const log = document.getElementById("chat-log");
+      log.textContent += `\n[user] ${msg}\n`;
+      input.value = "";
+      try {
+        const r = await postForm("/chat/copilot", { message: msg });
+        for (const t of r.turns) {
+          if (t.content) log.textContent += `[assistant] ${t.content}\n`;
+          for (const tr of t.tool_results || []) {
+            log.textContent += `  [tool:${tr.name}] ${tr.ok ? "OK" : "BLOCKED"} ${tr.ok ? JSON.stringify(tr.result) : tr.error}\n`;
+          }
+        }
+        if (r.agent_jwt) {
+          document.getElementById("agent-jwt-pre").textContent = r.agent_jwt;
+          document.getElementById("agent-jwt-status").textContent = "(active)";
+          document.getElementById("agent-jwt-status").style.color = "#34d399";
+        }
+        refreshPrincipal();
+        refreshAudit();
+        log.scrollTop = log.scrollHeight;
+      } catch (e) {
+        log.textContent += `[error] ${e.message}\n`;
+      }
+    }
+
+    async function runRevoke(kind) {
+      await postForm(`/revoke/${kind}`);
+      if (kind === "agent-token") {
+        document.getElementById("agent-jwt-pre").textContent = "(revoked)";
+        document.getElementById("agent-jwt-status").textContent = "(revoked)";
+        document.getElementById("agent-jwt-status").style.color = "#f87171";
+      } else if (kind === "session") {
+        window.location.href = "/login";
+      }
+      refreshPrincipal();
+    }
+
+    async function refreshPrincipal() {
+      try {
+        const r = await fetch("/api/principal");
+        if (r.ok) {
+          const p = await r.json();
+          const panel = document.getElementById("principal-panel");
+          panel.innerHTML =
+            `<div class="principal-row"><span class="k">Subject</span><span class="v">${p.sub}</span></div>` +
+            `<div class="principal-row"><span class="k">Role</span><span class="v">${p.role || '—'}</span></div>` +
+            `<div class="principal-row"><span class="k">Scopes</span><span class="v">${(p.scopes || []).join(', ')}</span></div>` +
+            `<div class="principal-row"><span class="k">Acting as</span><span class="v">${p.act ? p.act.sub : '— (direct)'}</span></div>` +
+            `<div class="principal-row"><span class="k">Client</span><span class="v">${p.client_id || '—'}</span></div>`;
+        }
+      } catch (e) {}
+    }
+
+    async function refreshAudit() {
+      try {
+        const r = await fetch("/api/audit-feed?limit=10");
+        const rows = await r.json();
+        const html = rows.map(row =>
+          `<div class="feed-row"><span class="type ${row.event_type}">${row.event_type}</span> · ` +
+          `sub=${row.sub || '—'} act=${row.act_sub || '—'} · ` +
+          `${new Date(row.ts).toLocaleTimeString()}</div>`
+        ).join("");
+        document.getElementById("audit-feed").innerHTML = html || "(empty)";
+      } catch (e) {}
+    }
+
+    async function refreshHeadless() {
+      try {
+        const r = await fetch("/api/headless-feed?limit=10");
+        const rows = await r.json();
+        const html = rows.map(row =>
+          `<div class="feed-row"><span class="type">${row.role}</span> · ` +
+          `${row.tool_name || row.content?.slice(0, 60) || ''} · ` +
+          `${new Date(row.ts).toLocaleTimeString()}</div>`
+        ).join("");
+        if (html) document.getElementById("headless-feed").innerHTML = html;
+      } catch (e) {}
+    }
+
+    // Initial loads + polling
+    refreshPrincipal();
+    refreshAudit();
+    refreshHeadless();
+    setInterval(refreshAudit, 3000);
+    setInterval(refreshHeadless, 3000);
+    document.getElementById("chat-input").addEventListener("keypress", (e) => {
+      if (e.key === "Enter") sendChat();
+    });
+  </script>
+</body>
+</html>
