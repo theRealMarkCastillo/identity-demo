@@ -39,7 +39,10 @@ def run_with_identity(user_id: str | None, actor_id: str | None, umask: str = "m
 
         def __exit__(self_, exc_type, exc, tb):
             try:
-                self_.conn.rollback()
+                if exc_type is None:
+                    self_.conn.commit()
+                else:
+                    self_.conn.rollback()
             finally:
                 self_.conn.close()
 
