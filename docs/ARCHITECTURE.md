@@ -44,6 +44,15 @@ The visual signature in the UI:
 - Delegated: `sub: "user_123"`, `act: { sub: "agent_copilot_99" }` ← human is the principal, agent is the actor
 - Headless: `sub: "agent_etl_nightly"`, no `act` ← agent IS the principal
 
+**Why exactly three?** The model is closed: every JWT has a `sub` (principal) and an optional `act` (actor). The principal is either a *human* or an *agent*. The actor, if present, is always an *agent*. That gives a 2×2 matrix of cells — minus the meaningless "(human acts as itself when there's no actor)" cell collapsing into one — yielding exactly **three** meaningful principal types:
+
+| | No actor (`act` absent) | Actor = agent |
+|---|---|---|
+| **Principal = human** | Human direct (#1) | Delegated agent (#2) |
+| **Principal = agent** | Headless agent (#3) | Nested delegation (out of scope — see §11) |
+
+The cell "principal = human, actor = human" is meaningless (humans don't act on behalf of other humans in this model). The cell "principal = agent, actor = agent" is multi-hop delegation — explicitly out of scope (see §11). What remains is three cells, and that's the entire taxonomy.
+
 ## 3. Design Decisions: Why These Standards
 
 ### OAuth 2.1 (not OAuth 2.0)
