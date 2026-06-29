@@ -246,6 +246,18 @@ We chose `jti` lookup because it gives instant revocation at the cost of one ind
 
 In production at higher scale, you'd back this with a cache (Redis with a short TTL on `jti → active`) or move to opaque + introspection for high-stakes endpoints where the lookup overhead is unacceptable.
 
+### Smaller implementation choices
+
+These are decisions that don't drive the demo's identity story but are worth being explicit about, since "why X and not Y?" is a common reader question.
+
+**Why FastAPI for the web app and control plane?** Python is the lingua franca of OAuth/OIDC tutorials and ecosystem (`python-jose`, `authlib`, `bcrypt`, `psycopg` are all Python-first). Flask would also work and is more familiar to most web developers, but FastAPI gives type-checked request/response models (which catch a lot of OAuth's easy-to-miss fields like `token_type_hint`), built-in OpenAPI docs at `/docs`, and async support for when an endpoint needs to wait on multiple services. Django is overkill for an API server. The framework doesn't affect the identity story — anywhere we use FastAPI, Flask or Express would work with the same OAuth flow.
+
+**Why BCrypt for password and `client_secret` hashing?** Three requirements: salted (so two users with the same password don't have the same hash), slow (so brute force is expensive), and tunable cost (so you can increase it as hardware speeds up). BCrypt hits all three with one algorithm and has been the safe default since the 1990s. The newer alternatives are **Argon2** (memory-hard, winner of the Password Hashing Competition, slightly better against GPU/ASIC attacks) and **scrypt** (similar memory-hard properties). For this demo, BCrypt is fine — Argon2 would be the choice for a greenfield production system today, and `passlib` makes the swap a one-line config change.
+
+**Why a single `audit_log` table for everything?** The schema has one `platform.audit_log` table that records token issuance, token exchange, refresh, revoke, RLS blocks, and (now) `cli-admin` actions. We could have split these into `platform.token_events`, `platform.rls_events`, `platform.admin_events` — but a single table makes the demo's narrative simpler ("look at the audit log to see everything that happened"). The `event_type` column discriminates, and the `details jsonb` carries event-specific fields. In production at scale you'd partition this table by time (monthly partitions) and consider an INSERT-only role to prevent tampering (currently any `control_plane_admin` can mutate it — see §11 Non-Goals).
+
+**Why short TTLs (1h access, 8h refresh)?** The access token TTL is the *upper bound* on revocation latency without checking `jti` (which we do anyway, but the TTL is the safety net). 1 hour balances UX (users don't get logged out mid-task) against security (a leaked token is usable for at most an hour). The 8h refresh token covers a workday; refreshes happen transparently, so users rarely notice. Production systems with higher security needs use 15-minute access tokens; consumer apps with lower needs use 24h+. The pattern in this demo — short access + longer refresh + active revocation lookup — is the standard OAuth 2.1 recommendation.
+
 ## 4. System Components
 
 ```
