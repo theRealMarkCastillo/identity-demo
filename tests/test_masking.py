@@ -209,14 +209,17 @@ def test_compute_umask_forces_masked_for_agents():
 
 
 def test_strip_full_suffix_cleans_scope_claim():
-    """Agent-issued tokens expose a scope claim with `.full` stripped, so the
-    claim honestly reflects what the bearer can actually see (the DB would
-    never return raw to an agent anyway, but this keeps the claim readable).
+    """Agent-issued tokens expose a scope claim with `.full` stripped AND
+    deduplicated (the base scope and its `.full` variant collapse to one
+    string) so the claim honestly reflects what the bearer can actually see.
     """
     roles = _import_roles_module()
     assert roles.strip_full_suffix(
         ["read:transactions", "read:transactions.full"]
-    ) == ["read:transactions", "read:transactions"]
+    ) == ["read:transactions"]
+    assert roles.strip_full_suffix(
+        ["read:transactions.full", "read:transactions"]
+    ) == ["read:transactions"]
     assert roles.strip_full_suffix(["read:transactions"]) == ["read:transactions"]
     assert roles.strip_full_suffix([]) == []
 

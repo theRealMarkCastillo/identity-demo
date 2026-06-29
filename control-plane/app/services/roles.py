@@ -44,8 +44,20 @@ def strip_full_suffix(scopes: list[str]) -> list[str]:
     """Remove the trailing `.full` suffix from each scope (principal-type floor).
 
     e.g. ['read:transactions', 'read:transactions.full'] -> ['read:transactions'].
+
+    Dedupes the result because the base scope ('read:transactions') and its
+    `.full` variant ('read:transactions.full') collapse to the same string,
+    and a JWT scope claim with two identical entries is confusing.
+
     Applied to agent-issued tokens so the scope claim reflects what the agent
     can actually do (the DB will never return raw to an agent regardless, but
     keeping the scope claim honest avoids confusing operators reading tokens).
     """
-    return [s[:-len(".full")] if s.endswith(".full") else s for s in scopes]
+    out: list[str] = []
+    seen: set[str] = set()
+    for s in scopes:
+        new = s[:-len(".full")] if s.endswith(".full") else s
+        if new not in seen:
+            seen.add(new)
+            out.append(new)
+    return out

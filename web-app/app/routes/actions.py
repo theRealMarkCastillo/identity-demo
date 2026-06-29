@@ -1,6 +1,7 @@
 """Action routes: human-write, copilot-read, copilot-write, copilot-full, headless, chat, audit feed, revoke."""
 import json
 import logging
+import time
 from datetime import datetime
 from decimal import Decimal
 
@@ -57,6 +58,29 @@ def _umask_from_claims(claims: dict) -> str:
     The control plane is the only place this should be set; we just propagate.
     """
     return claims.get("umask") or "masked"
+
+
+def _cache_agent_token(sess: dict, agent_t: dict, requested_scopes: list[str]) -> None:
+    """Store the agent token AND metadata so the dashboard's principal panel
+    has something to show that's distinct across mints.
+
+    Without the metadata, the granted scope and umask are invariants of
+    {agent_id, role pair} -- the principal-type floor always produces the
+    same visible text. The metadata surfaces the parts that DO change:
+    `jti_short`, `minted_at`, and the `requested_scopes` (what the user
+    asked for, before the floor stripped .full).
+    """
+    agent_jwt: str = agent_t["access_token"]
+    claims = jwt_verify.decode_unverified(agent_jwt)
+    sess["agent_token"] = agent_jwt
+    sess["agent_token_meta"] = {
+        "jti_short": (claims.get("jti") or "")[:8],
+        "minted_at": int(time.time()),
+        "agent_id": (claims.get("act") or {}).get("sub", "?"),
+        "requested_scopes": list(requested_scopes),
+        "granted_scopes": (claims.get("scope") or "").split() or [],
+        "umask": claims.get("umask") or "masked",
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -184,10 +208,10 @@ def action_copilot_read(request: Request, csrf_token: str = Form(...)):
 
     # Exchange for agent token
     agent_t = oauth_client.exchange_for_agent_token(human_jwt, "agent_copilot_99")
-    agent_jwt = agent_t["access_token"]
-    agent_claims = jwt_verify.decode_unverified(agent_jwt)
+    _cache_agent_token(sess, agent_t, requested_scopes=["read:transactions"])
 
-    sess["agent_token"] = agent_jwt
+    agent_jwt = sess["agent_token"]
+    agent_claims = jwt_verify.decode_unverified(agent_jwt)
 
     umask = _umask_from_claims(agent_claims)
     with run_with_identity(user_id=agent_claims["sub"], actor_id=agent_claims["act"]["sub"], umask=umask) as conn:
@@ -221,10 +245,16 @@ def action_copilot_full(request: Request, csrf_token: str = Form(...)):
     sess = _require_session(request)
     human_jwt = sess["tokens"]["access_token"]
 
-    # Mint a fresh agent token (regular exchange; the floor is applied server-side).
+    # Mint a fresh agent token. Note: the user "tried" to grant .full, but the
+    # control plane's principal-type floor will strip it -- this is the
+    # whole demo. We capture the requested scopes here so the principal
+    # panel can show both "Requested" and "Granted (after floor)" side-by-side.
     agent_t = oauth_client.exchange_for_agent_token(human_jwt, "agent_copilot_99")
-    agent_jwt = agent_t["access_token"]
-    sess["agent_token"] = agent_jwt
+    _cache_agent_token(
+        sess, agent_t,
+        requested_scopes=["read:transactions", "read:transactions.full"],
+    )
+    agent_jwt = sess["agent_token"]
     agent_claims = jwt_verify.decode_unverified(agent_jwt)
 
     # Read the SUBJECT token's umask too — that's what the human would see if
@@ -341,7 +371,7 @@ def chat_copilot(request: Request, message: str = Form(...), csrf_token: str = F
         # Ensure we have an agent token
         if not sess.get("agent_token"):
             agent_t = oauth_client.exchange_for_agent_token(human_jwt, "agent_copilot_99")
-            sess["agent_token"] = agent_t["access_token"]
+            _cache_agent_token(sess, agent_t, requested_scopes=["read:transactions"])
 
         agent_claims = jwt_verify.decode_unverified(sess["agent_token"])
         user_id = agent_claims["sub"]
@@ -509,6 +539,7 @@ def current_principal(request: Request):
             "scope": agent_claims.get("scope"),
             "umask": agent_claims.get("umask") or "masked",
             "client_id": agent_claims.get("client_id"),
+            "meta": sess.get("agent_token_meta") or {},
         }
         result["agent"] = agent_block
     return JSONResponse(result)
@@ -581,6 +612,7 @@ def revoke_agent(request: Request, csrf_token: str = Form(...)):
         except Exception:
             pass
         sess.pop("agent_token", None)
+        sess.pop("agent_token_meta", None)
     response = JSONResponse({"status": "agent_token_revoked"})
     _set_session_cookie(response, sess)
     return response

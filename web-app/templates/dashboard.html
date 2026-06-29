@@ -308,6 +308,12 @@
         ? `<span class="umask-badge raw" title="${hint || 'Token grants raw PII access'}">umask: raw</span>`
         : `<span class="umask-badge masked" title="${hint || 'Token grants masked PII only'}">umask: masked</span>`;
     }
+    function fmtTime(unixSec) {
+      if (!unixSec) return '—';
+      const d = new Date(unixSec * 1000);
+      const p = n => String(n).padStart(2, '0');
+      return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    }
 
     // ===========================================================================
     // JWT panel management
@@ -396,11 +402,28 @@
 
         let agentBlock = '';
         if (a) {
+          // Meta distinguishes successive mints so the block visibly reacts.
+          const m = a.meta || {};
+          const jti = m.jti_short ? ` · jti <code>${m.jti_short}…</code>` : '';
+          const minted = m.minted_at ? ` · minted ${fmtTime(m.minted_at)}` : '';
+          // Requested vs granted: the principal-type floor strips `.full` from
+          // granted scopes. Showing both is the actual floor evidence.
+          let scopeDetail = '';
+          if (m.requested_scopes && m.requested_scopes.length) {
+            const req = m.requested_scopes.join(', ');
+            const gran = (m.granted_scopes || []).join(', ');
+            scopeDetail =
+              `<div class="principal-row"><span class="k" style="color:#94a3b8;">Requested</span><span class="v" style="word-break:break-word;color:#cbd5e1;">${req}</span></div>` +
+              (req !== gran
+                ? `<div class="principal-row"><span class="k" style="color:#fbbf24;">Granted (after floor)</span><span class="v" style="word-break:break-word;">${gran}</span></div>`
+                : `<div class="principal-row"><span class="k" style="color:#94a3b8;">Granted</span><span class="v" style="word-break:break-word;">${gran}</span></div>`);
+          }
           agentBlock =
             `<div style="margin-top:12px;padding-top:8px;border-top:1px solid #334155;">` +
-              `<div style="font-size:11px;color:#fbbf24;margin-bottom:4px;">Active delegation</div>` +
+              `<div style="font-size:11px;color:#fbbf24;margin-bottom:4px;">Active delegation${jti}${minted}</div>` +
               `<div class="principal-row"><span class="k">Acting as</span><span class="v">${a.act ? a.act.sub : '—'}</span></div>` +
-              `<div class="principal-row"><span class="k">Granted scope</span><span class="v" style="word-break:break-word;">${a.scope || '—'}</span></div>` +
+              `<div class="principal-row"><span class="k">Claimed scope</span><span class="v" style="word-break:break-word;">${a.scope || '—'}</span></div>` +
+              scopeDetail +
               `<div class="principal-row"><span class="k">Agent umask</span><span class="v">${umaskBadge(a.umask, 'Principal-type floor: agents are always masked')}</span></div>` +
               `<div class="principal-row"><span class="k">Agent client</span><span class="v">${a.client_id || '—'}</span></div>` +
             `</div>`;
