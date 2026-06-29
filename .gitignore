@@ -81,3 +81,9 @@ test.sqlite
 # --- Postgres data dumps (if anyone exports) ---
 *.dump
 *.pgdump
+
+# --- Node / scripts/ ---
+# scripts/ holds a Node tool (mermaid via check-mermaid.mjs); the lockfile
+# is tracked but the install tree is not.
+node_modules/
+scripts/node_modules/
