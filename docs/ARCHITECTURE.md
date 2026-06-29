@@ -1,5 +1,20 @@
 # Architecture: Local Identity & Agent Authorization Demo
 
+## 0. How to Read This Doc
+
+If you're new to the demo, read in this order:
+
+1. **Purpose (§1)** — the problem this demo solves and the story it tells.
+2. **The Three Principals (§2)** — the mental model: human / delegated agent / headless agent.
+3. **Design Decisions: Why These Standards (§3)** — *why* OAuth 2.1, RFC 8693, PKCE, JWT+JWKS, RLS via GUCs, three-tier authz, separate AS, RS256, and a non-superuser DB role.
+4. **System Components (§4)** — the moving pieces and how they connect.
+5. **Token Lifecycle (§5)**, **Identity Propagation (§6)**, **OAuth Flows (§7)** — the mechanics, in order of depth. §7 has six Mermaid sequence diagrams including JWT verification, RLS enforcement, and revocation.
+6. **Threat Model (§8)**, **FAQ (§9)** — explicit enumeration of what this demo defends against, plus 25+ Q&As on concepts, tech, ops, comparisons, and pitfalls.
+7. **Audit & Observability (§10)**, **Security Properties (§11)** — the verification story.
+8. **Glossary (§12)**, **Non-Goals (§13)**, **External IDP Integration (§14)**, **File Map (§15)** — reference material.
+
+The Glossary (§12) defines every term used throughout (principal, actor, GUC, downscoping, etc.). Skip ahead to it whenever a term is unfamiliar. §14 explains how to swap the custom control plane for Okta/Auth0/Keycloak/etc. in production, including an RFC 8693 support matrix.
+
 ## 1. Purpose
 
 Most AI agent demos connect to a database with a single broad service account. This means:
@@ -29,7 +44,114 @@ The visual signature in the UI:
 - Delegated: `sub: "user_123"`, `act: { sub: "agent_copilot_99" }` ← human is the principal, agent is the actor
 - Headless: `sub: "agent_etl_nightly"`, no `act` ← agent IS the principal
 
-## 3. System Components
+## 3. Design Decisions: Why These Standards
+
+### OAuth 2.1 (not OAuth 2.0)
+
+OAuth 2.1 is the IETF's best-practices consolidation of OAuth 2.0. It drops legacy grant types and makes several security features mandatory rather than optional. We use it because:
+
+- **Implicit grant is dead.** Tokens can never leak through URL fragments. Only authorization code + PKCE (for humans) and client credentials (for agents) remain.
+- **PKCE is mandatory (S256 only).** Even in OAuth 2.0, PKCE was "recommended" — here it's required. This prevents authorization code interception attacks. The control plane rejects any `/authorize` request without a `code_challenge` or with a method other than `S256`.
+- **No refresh tokens for client credentials.** In OAuth 2.0, a client credentials grant could return a refresh token, creating a long-lived credential for a machine. OAuth 2.1 says no. This demo's headless agents re-authenticate every tick instead of holding a persistent refresh token — a more realistic model for short-lived machine credentials.
+- **Refresh token rotation.** OAuth 2.1 requires that each refresh replaces the old token. Our control plane revokes the old `jti` and issues a new one on every refresh, preventing stolen refresh tokens from being silently replayed.
+- **RFC 7009 revocation.** Explicit token kill-switch, required by OAuth 2.1.
+
+In short: OAuth 2.1 means we get the strongest OAuth-native posture out of the box — no legacy footguns, no optional security. Every flow in this demo would pass an OAuth 2.1 spec audit.
+
+### RFC 8693 Token Exchange — delegated identity
+
+Without RFC 8693, if a user wants an AI copilot to act on their behalf, you have two bad options:
+
+1. **Pass the user's token directly** → the agent inherits the user's full permissions. A read-only copilot can suddenly write and delete.
+2. **Give the agent its own identity** → the audit log says "agent_copilot_99 did it," losing the trail back to the human who asked.
+
+RFC 8693 solves both by standardizing a token exchange where the authorization server mints a **new** JWT with:
+
+| Claim | Meaning |
+|---|---|
+| `sub: user_123` | The **principal** — who is ultimately responsible |
+| `act.sub: agent_copilot_99` | The **actor** — who executed the action |
+| `scope: read:transactions` | The intersection of the user's permissions and the agent's allowed scope (downscoping) |
+
+The `act` claim is defined in RFC 8693. Any compliant system can read it and distinguish "a human did this" from "a human's agent did this." The database's RLS policies use both `sub` and `act.sub` to enforce that delegated agents can only read the user's own rows, with no write capability — even if the human user has full CRUD.
+
+### Authorization Code + PKCE (RFC 7636) — not just the code grant
+
+Authorization code alone is vulnerable to interception: if an attacker steals the code from the redirect URI, they can exchange it for tokens. PKCE adds a cryptographic binding between the authorization request and the token request:
+
+1. The web app generates a random `code_verifier` and a `code_challenge = SHA256(code_verifier)`.
+2. The challenge is sent with `/authorize`. The control plane stores it alongside the auth code.
+3. On `/oauth/token`, the web app sends the verifier. The control plane hashes it and compares against the stored challenge.
+4. An attacker who intercepted the code does NOT have the verifier → the exchange fails.
+
+We enforce **S256 only** (no `plain` fallback), as required by OAuth 2.1.
+
+### JWT + JWKS (RS256) — cryptographic identity, not trust
+
+Tokens are RS256-signed JWTs. The web app fetches the control plane's public key from `/.well-known/jwks.json` and **cryptographically verifies** every token (signature, issuer, audience, expiry) before trusting it. This means:
+
+- The database never needs to call back to the control plane to validate a token — it verifies locally with the public key.
+- No shared secret between the web app and the control plane. Only the control plane holds the private key.
+- JWTs carry structured claims (`sub`, `scope`, `act`, `jti`) that every layer can read without a network round-trip.
+
+### Postgres RLS via GUCs (`SET LOCAL`) — identity into the database
+
+The core identity propagation pattern: the application sets Postgres session variables (`SET LOCAL app.user_id, app.actor_id`) before executing queries, and RLS policies read those variables to enforce row-level access:
+
+- **`SET LOCAL`** means the variables are scoped to the current transaction. After commit/rollback, they reset. This is safe under connection pooling — no other request sees stale identity state.
+- **Why not pass identity as query parameters?** Prevents SQL injection risk and keeps identity out of query logs. The GUCs live in the session, not the SQL text.
+- **RLS as the last line of defense:** even if token scope validation and role mapping are bypassed, the database itself enforces that a delegated agent cannot write, and a headless agent can only see shared rows.
+
+### Three-tier authorization — defense in depth
+
+| Tier | What enforces it | Example |
+|---|---|---|
+| 1. Token scope | Control plane at issuance | Agent JWT has `scope=read:transactions` — the web app can check this without a DB call |
+| 2. Role mapping | `platform.roles` + `platform.role_scopes` in the DB | `senior_analyst` gets R+W, `junior_analyst` gets R only |
+| 3. Row-level security | Postgres RLS policies | `owner_user_id = current_user_id()`; agent can't read rows it doesn't own |
+
+No single layer is trusted to get it right. The database is the last and strongest line.
+
+### Why a separate authorization server?
+
+The control plane is a different process from the web app. That's deliberate. Three reasons:
+
+1. **Single Responsibility.** Auth code is hard to get right (CSRF, session fixation, password hashing, rate limiting, lockout, ...). Concentrating it in one well-reviewed service is safer than re-implementing it in every application.
+2. **Specialization.** Adding MFA, SAML federation, or social login means upgrading *one* service, not every web app. Swapping the control plane for Okta in production (§14) is a configuration change, not a rewrite.
+3. **Independent deployment and scaling.** The web app can be scaled horizontally without worrying about auth state; the control plane can be scaled independently based on login volume. They can fail over separately.
+
+The trade-off: one more service to operate. For a single-app demo this is overkill, but for any organization running more than one application it pays for itself immediately.
+
+### Why RS256, not HS256?
+
+Both are JWT signing algorithms, but they differ in a security-critical way:
+
+| Algorithm | Key model | Who can verify? | Who can forge? |
+|---|---|---|---|
+| **HS256** (HMAC-SHA256) | Symmetric — one secret | Anyone with the secret | Anyone with the secret |
+| **RS256** (RSA-SHA256) | Asymmetric — key pair | Anyone with the **public** key | Only the holder of the **private** key |
+
+In this demo, the control plane signs with a private RSA key. The web app, the database connection pool, and any other service can verify tokens using the public key from `/.well-known/jwks.json` — but none of them can forge a new token.
+
+Why this matters in distributed systems: with HS256, every service that needs to verify a token also needs the signing secret — and a service that holds the secret can mint tokens for *any* user. With RS256, the public key is genuinely public. You can paste it on a billboard. The private key never leaves the control plane.
+
+This is also why key rotation works without downtime: publish a new public key with a new `kid`, retire the old one after the cache TTL expires. The control plane doesn't have to coordinate with every verifier.
+
+### Why a non-superuser database role?
+
+The web app connects to Postgres as `app_session`, **not** as `postgres`. Postgres only enforces RLS for non-superuser connections (superusers bypass RLS by design). This is **principle of least privilege** at the database layer:
+
+| Role | What it can do | Used by |
+|---|---|---|
+| `postgres` | Everything, bypasses RLS | `init.sql` only — schema setup |
+| `control_plane_admin` | Read/write `platform.*` tables, can't bypass RLS on `target.*` | Control plane (audit log + token records) |
+| `app_session` | CRUD on `target.*`, RLS enforced, no schema changes | Web app + cli-agent (the *only* role that runs user-driven queries) |
+
+If an attacker compromises the web app, they can issue queries as `app_session` — but RLS still filters what rows they can see, and they cannot `DROP TABLE`, alter policies, or impersonate other identities. The blast radius of a web app compromise is bounded by the database role's permissions.
+
+This is why the web app never holds DB admin credentials. Production note: in a real deployment you'd also want network-level isolation (separate DB users per service, network policies, mTLS) — see §13 for the full list of production concerns.
+
+## 4. System Components
 
 ```
 ┌─────────────────────┐
@@ -74,7 +196,7 @@ The visual signature in the UI:
 **Network:** `identity-net` (bridge).
 **LLM:** External OpenAI-compatible endpoint (user-provided URL + key + model).
 
-## 4. Token Lifecycle
+## 5. Token Lifecycle
 
 ### Issuance paths
 
@@ -109,7 +231,7 @@ The visual signature in the UI:
 - After revoke, subsequent calls with that token return 401 from `/oauth/userinfo` and "active: false" from `/oauth/introspect`
 - Headless agent tokens are NOT refreshable — agent re-authenticates each tick (realistic for short-lived credentials)
 
-## 5. Identity Propagation: JWT → Postgres GUC → RLS
+## 6. Identity Propagation: JWT → Postgres GUC → RLS
 
 This is the core pattern, used in three places.
 
@@ -154,72 +276,346 @@ USING (
 
 Even if all three were bypassed, the database itself rejects unauthorized actions.
 
-## 6. OAuth Flows (Sequence)
+## 7. OAuth Flows (Sequence)
 
-### Authorization Code + PKCE (Human)
+The diagrams below use [Mermaid](https://mermaid.js.org/), which GitHub renders natively.
 
-```
-Browser  Web-App   Control-Plane   identity-db
-  │         │            │              │
-  │─click──>│            │              │
-  │         │─gen verifier+challenge    │
-  │         │─redirect(/authorize)────>│
-  │<─login form────│
-  │─POST creds──>│
-  │         │            │<verify>──────>│
-  │         │            │<return role──│
-  │         │            │─gen code+verifier
-  │<─redirect(callback?code)─│
-  │─GET /callback?code──>│
-  │         │─POST /oauth/token(code,verifier)──>│
-  │         │            │<verify code+verifier──>│
-  │         │            │─resolve role+scopes
-  │         │            │─mint JWT (RS256)
-  │         │            │─write platform.token_records
-  │         │            │─write platform.audit_log
-  │         │<─{access_token, refresh_token, scope}─│
-  │         │─store in session cookie
-  │<─redirect(/dashboard)│
-```
+### 7.1 Authorization Code + PKCE (Human)
 
-### RFC 8693 Token Exchange (Delegated Agent)
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as Browser
+    participant W as Web App
+    participant CP as Control Plane
+    participant DB as Postgres
 
-```
-Web-App         Control-Plane         identity-db
-  │                  │                    │
-  │─POST /oauth/token (grant_type=token-exchange)
-  │  subject_token=<human JWT>
-  │  actor_token=agent:agent_copilot_99
-  │─────────────────>│
-  │                  │─verify subject JWT (own key)
-  │                  │─resolve agent from platform.agents
-  │                  │─compute effective = subject.scopes ∩ agent.default_scopes
-  │                  │─mint NEW JWT (sub=human, act.sub=agent, downscoped scope)
-  │                  │─write platform.token_records (act_sub set)
-  │                  │─write platform.audit_log (event=token_exchange)
-  │<─{access_token, issued_token_type=jwt}──│
-  │─SET LOCAL app.user_id=<human>, app.actor_id=<agent>
-  │─execute tool with RLS-enforced identity
+    U->>W: Click "Sign in"
+    W->>W: Generate code_verifier + SHA256(code_verifier) = code_challenge
+    W->>CP: GET /authorize (response_type=code, code_challenge, state, ...)
+    CP-->>U: Login form (HTML)
+    U->>CP: POST user_id + password
+    CP->>DB: SELECT user, verify password (BCrypt)
+    DB-->>CP: user + role
+    CP->>CP: Generate auth code, store (code → code_challenge)
+    CP-->>U: 302 redirect → redirect_uri?code=...&state=...
+    U->>W: GET /callback?code=...
+    W->>CP: POST /oauth/token (grant_type=authorization_code, code, code_verifier)
+    CP->>CP: Verify code_challenge matches SHA256(code_verifier)
+    CP->>DB: SELECT role → compute effective scopes
+    CP->>CP: Mint access JWT (RS256), generate refresh token
+    CP->>DB: INSERT platform.token_records (jti, sub, scope, exp)
+    CP->>DB: INSERT platform.audit_log (event=token_issue, sub=user)
+    CP-->>W: { access_token, refresh_token, scope }
+    W->>W: Store tokens in signed session cookie (itsdangerous)
+    W-->>U: 302 redirect → /dashboard
 ```
 
-### Client Credentials (Headless Agent)
+### 7.2 RFC 8693 Token Exchange (Delegated Agent)
 
-```
-cli-agent/web-app   Control-Plane        identity-db
-  │                       │                  │
-  │─POST /oauth/token (Basic auth, grant=client_credentials)
-  │──────────────────────>│
-  │                       │─verify client_id+secret
-  │                       │─check client_type='agent'
-  │                       │─resolve scopes from platform.agents
-  │                       │─mint JWT (sub=agent, no act)
-  │                       │─write audit_log (event=token_issue_principal=agent)
-  │<─{access_token, issued_token_type=jwt}──│
-  │─SET LOCAL app.user_id='', app.actor_id=<agent>
-  │─execute tool with RLS-enforced identity
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as Web App
+    participant CP as Control Plane
+    participant DB as Postgres
+
+    Note over W: User clicked "Copilot" — has a valid access JWT in session
+
+    W->>CP: POST /oauth/token<br/>grant_type=token-exchange<br/>subject_token=<user JWT><br/>actor_token=agent:agent_copilot_99<br/>actor_token_type=...agent
+    CP->>CP: Verify subject JWT signature (own public key)
+    CP->>DB: SELECT agent WHERE agent_id=agent_copilot_99
+    DB-->>CP: agent + default_scopes + is_delegatable
+    CP->>CP: effective = subject.scope ∩ agent.default_scopes
+    alt effective is empty
+        CP-->>W: 400 invalid_scope
+    end
+    CP->>CP: Mint NEW JWT (sub=user, act.sub=agent, scope=effective)
+    CP->>DB: INSERT platform.token_records (jti, sub=user, act_sub=agent)
+    CP->>DB: INSERT platform.audit_log (event=token_exchange, sub=user, act_sub=agent)
+    CP-->>W: { access_token, issued_token_type=jwt, scope }
+    W->>DB: BEGIN
+    W->>DB: SET LOCAL app.user_id = <user><br/>SET LOCAL app.actor_id = <agent>
+    W->>DB: <tool query> — RLS enforces "delegated read-only on user's rows"
+    DB-->>W: result or BLOCKED
+    W->>DB: COMMIT (GUCs reset)
 ```
 
-## 7. Audit & Observability
+### 7.3 Client Credentials (Headless Agent)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as cli-agent
+    participant CP as Control Plane
+    participant DB as Postgres
+
+    A->>CP: POST /oauth/token<br/>Authorization: Basic base64(agent_etl_nightly:secret)<br/>grant_type=client_credentials&scope=read:transactions
+    CP->>DB: SELECT client WHERE client_id=agent_etl_nightly
+    DB-->>CP: client + BCrypt(secret) hash
+    CP->>CP: Verify BCrypt(secret) — match
+    CP->>DB: SELECT client_type → 'agent'
+    CP->>DB: SELECT agent.default_scopes WHERE agent_id=client_id
+    DB-->>CP: default_scopes
+    CP->>CP: effective = requested ∩ agent.default_scopes (or default if none requested)
+    CP->>CP: Mint JWT (sub=agent_id, scope=effective, NO act claim)
+    CP->>DB: INSERT platform.token_records (jti, sub=agent)
+    CP->>DB: INSERT platform.audit_log (event=token_issue_principal=agent)
+    CP-->>A: { access_token, scope, expires_in }
+    A->>DB: BEGIN
+    A->>DB: SET LOCAL app.user_id = '' (NULL)<br/>SET LOCAL app.actor_id = <agent>
+    A->>DB: <tool query> — RLS enforces "headless sees only shared rows"
+    DB-->>A: result or BLOCKED
+    A->>DB: COMMIT (GUCs reset)
+```
+
+### 7.4 JWT Verification (every incoming request)
+
+This is what the web app does **before trusting any token** — it never calls back to the control plane.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client (browser/agent)
+    participant W as Web App
+    participant JWKS as /.well-known/jwks.json
+    participant DB as Postgres
+
+    C->>W: Request + Authorization: Bearer <jwt>
+    W->>JWKS: GET jwks.json (cached; refresh on miss)
+    JWKS-->>W: { keys: [{ kid, kty, n, e, alg }] }
+    W->>W: Verify RS256 signature with public key (kid match)
+    W->>W: Verify iss == identity-control-plane
+    W->>W: Verify aud == target-api
+    W->>W: Verify exp > now (and iat < now)
+    W->>W: Extract claims: sub, scope, act?, client_id, jti
+    W->>DB: SELECT jti FROM platform.token_records WHERE jti=? AND revoked=FALSE
+    DB-->>W: row (active) or NULL (revoked)
+    alt Token revoked or invalid
+        W-->>C: 401 Unauthorized
+    end
+    W->>W: Open transaction, call run_with_identity(sub, act.sub, scope)
+    W->>DB: SET LOCAL app.user_id, app.actor_id
+    W->>DB: <tool query>
+    DB-->>W: result
+```
+
+### 7.5 RLS Enforcement (database as last line of defense)
+
+When a tool query runs, the database itself rejects unauthorized rows — even if the web app's token-scope check is wrong.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as Web App / cli-agent
+    participant DB as Postgres
+
+    W->>DB: BEGIN
+    W->>DB: SET LOCAL app.user_id = 'user_123'<br/>SET LOCAL app.actor_id = 'agent_copilot_99'
+    W->>DB: SELECT * FROM target.transactions WHERE amount > 100
+    DB->>DB: RLS policy select_policy runs for each candidate row
+    Note over DB: USING clause evaluates:<br/>current_actor_id() IS NOT NULL<br/>AND current_user_id() IS NOT NULL<br/>AND owner_user_id = current_user_id()
+    alt Row passes the policy (e.g., user_123 owns this row)
+        DB-->>W: row returned
+    else Row fails the policy (e.g., user_123 doesn't own it)
+        DB->>DB: Row silently excluded (no error — empty result set)
+    end
+    W->>DB: UPDATE target.transactions SET amount=9999 WHERE id=1
+    DB->>DB: RLS policy modify_human_only runs<br/>(actor_id is set → REJECTED)
+    DB-->>W: ERROR: new row violates row-level security policy
+    W->>DB: <write to platform.audit_log event=rls_block>
+    DB-->>W: audit recorded
+    W->>DB: COMMIT (or ROLLBACK — GUCs reset)
+```
+
+### 7.6 Token Revocation (RFC 7009)
+
+When a user clicks "Revoke Agent Delegation", the agent's token dies immediately — even mid-conversation.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User (browser)
+    participant W as Web App
+    participant CP as Control Plane
+    participant DB as Postgres
+    participant A as Agent (copilot)
+
+    U->>W: POST /revoke/agent (form, with CSRF token)
+    W->>CP: POST /oauth/revoke (token=<agent JWT>, token_type_hint=access_token)
+    CP->>DB: UPDATE platform.token_records SET revoked=TRUE WHERE jti=<agent jti>
+    DB-->>CP: 1 row updated
+    CP-->>W: 200 OK (RFC 7009 returns 200 even for unknown tokens)
+    W->>W: Invalidate local session entry for the agent token
+
+    Note over A: Agent's LLM tool call mid-conversation
+    A->>W: Tool call + Authorization: Bearer <revoked agent JWT>
+    W->>W: Verify signature, iss, aud, exp — still valid
+    W->>DB: SELECT jti FROM platform.token_records WHERE jti=? AND revoked=FALSE
+    DB-->>W: NULL (revoked)
+    W-->>A: 401 Unauthorized {error: "token revoked"}
+    A->>U: "I lost authorization mid-conversation. Please re-delegate."
+```
+
+## 8. Threat Model
+
+This section enumerates the threats this demo defends against, the mechanism that stops each, and the threats that fall outside the demo's scope. It's the bridge between the design decisions (§3) and the security properties (§11): every defense has a corresponding threat, and vice versa.
+
+### Threats explicitly defended against
+
+| Threat | How this demo defends |
+|---|---|
+| **Forged access token** (attacker mints a JWT without the control plane's key) | RS256 signing + JWKS verification. The attacker doesn't have the private key — see §3 ("Why RS256, not HS256?"). |
+| **Authorization code interception** (attacker steals the `?code=` from the redirect) | PKCE (S256). The control plane stored a `code_challenge`; only the legitimate client holds the matching `code_verifier` — see §3. |
+| **Stolen refresh token replay** | OAuth 2.1 refresh token rotation + RFC 7009 revocation. Each refresh issues a new token and revokes the old `jti`. A stolen refresh token can only be used once before it's dead — see §7.1. |
+| **Compromised agent reads user's private data** | RFC 8693 downscoping + RLS. The agent's effective scope is the intersection of its defaults and the user's grants; RLS filters by `current_user_id()` — see §3, §7.2, §7.5. |
+| **Compromised agent writes/deletes** | RLS `modify_human_only` policy. Any write with a non-null `current_actor_id()` is rejected by Postgres, even if the human user could have written — see §7.5. |
+| **Headless agent accesses a specific user's rows** | RLS `current_user_id() IS NULL` branch. Headless agents only see rows where `is_shared=TRUE` — they cannot impersonate a user because there is no user `sub` to set. |
+| **Token theft via SQL injection** (attacker injects a different `sub` into a query) | Identity is set via Postgres GUCs, not query parameters. The SQL text never contains user identity — see §3 ("Postgres RLS via GUCs"). |
+| **Token theft via Postgres logs** | GUCs are session state, not in SQL text. They don't appear in `pg_stat_statements`, slow query log, or application logs. |
+| **Cross-tenant data leak** (request from user A inherits identity from a previous user B) | `SET LOCAL` is transaction-scoped. After commit/rollback, GUCs reset. Connection pool can't leak identity between requests — see §3. |
+| **LLM hallucinates a destructive action** | Tool calls run with the agent's identity. RLS rejects writes. The attempt is logged to `platform.audit_log` and surfaced in the UI as a BLOCKED result — see §10. |
+| **User keeps an agent running after changing their mind** | RFC 7009 revocation. The user clicks "Revoke Agent Delegation"; the control plane flips `revoked=TRUE` on the `jti`; the web app's revocation check rejects the next request — see §7.6. |
+| **Audit gap** ("we don't know who did this") | Every token event (issue, exchange, refresh, revoke) and every RLS block is written to `platform.audit_log` with `sub` + `act_sub` + `client_id` + `agent_id` — see §10. |
+| **Production-style downgrade attack** (attacker forces the flow to use a weaker algorithm) | OAuth 2.1 enforcement: no implicit, no password, no `plain` PKCE. The control plane rejects non-S256 challenges at `/authorize`. |
+| **Client secret leaks from one service to another** | Client credentials (headless agents) are bound to a specific `client_id` and `allowed_scopes`. The agent's claims are its own — it cannot impersonate a user because there's no user to impersonate. |
+
+### Threats this demo does NOT defend against
+
+These are real threats, but they're explicitly out of scope. Each is mitigated in production by infrastructure, processes, or components this demo does not include.
+
+| Threat | Why this demo doesn't defend against it | What production does |
+|---|---|---|
+| **Compromised authorization server** (attacker steals the signing key) | The demo holds `signing.pem` in a file on disk | HSM (AWS CloudHSM, GCP KMS, Azure Key Vault); key rotation via JWKS `kid`; multi-party signing |
+| **Compromised web app code** | Demo assumes the web app is trusted | Code signing, supply-chain security (Sigstore, SLSA), runtime app self-protection (RASP) |
+| **Compromised DB admin** (someone with `control_plane_admin` modifies audit logs) | Anyone with that role can in principle mutate `platform.audit_log` | INSERT-only role for audit writes, hash-chain triggers, append-only log store (AWS QLDB, immudb), external SIEM |
+| **Compromised user device** (attacker has the user's password *and* MFA) | Demo has no MFA — see §13 | MFA, WebAuthn, device binding, risk-based authentication, anomaly detection |
+| **Insider threat with DB access** | Demo runs on localhost with a single trust boundary | Separation of duties, just-in-time access, database activity monitoring (DAM), privileged access management |
+| **Network MITM** (attacker intercepts HTTP traffic) | Demo is HTTP-only on localhost — see §13 | TLS everywhere, mTLS for service-to-service, HSTS, certificate pinning |
+| **LLM prompt injection bypasses tool guards** | The LLM is trusted to follow its system prompt; tools execute whatever the LLM asks for | Output filtering, structured tool constraints, separate "action approval" model, human-in-the-loop for destructive ops |
+| **Denial of service** | Demo has no rate limiting | Rate limiting at the edge, WAF, autoscaling, circuit breakers |
+| **Token theft via browser extensions / XSS** | Demo doesn't have CSP or strict cookie attributes | Strict CSP, `SameSite=strict` cookies, `__Host-` cookie prefix, output encoding |
+| **Authorization policy drift** (someone changes `platform.role_scopes` and breaks things silently) | No version history on the policy tables — see §13 | Policy-as-code (OPA, Cedar), change tracking, policy diffs in CI |
+
+### Residual risks (within scope, but worth naming)
+
+Even within what this demo *does* defend, there are still residual risks:
+
+- **The control plane's `client_secret` for the web app and headless agent are in `.env`.** Anyone with read access to the repo in production can rotate those. This is a demo-scope concern, not a design flaw — production uses a secrets manager.
+- **The audit log is only as trustworthy as the database.** If the DB itself is compromised (admin-level access), the audit log can be rewritten. Mitigated by the INSERT-only / append-only approaches listed above.
+- **The LLM may not always attempt a write** during the demo (depends on the model and prompt). If the LLM never tries, the RLS-block story can't be shown — but the *defense* is still in place and provable via direct SQL.
+
+### How to use this section
+
+When evaluating the demo, walk down the "defended against" table and ask: *"is the mechanism actually wired up in the code?"* Cross-reference each row with the file map (§15) and verify the implementation. Then look at the "not defended" table and decide which of those matter for *your* threat model before deploying.
+
+## 9. FAQ
+
+Common questions, organized by category. For live-demo Q&A prep see [RUNBOOK.md §9 Talking-Point Cheat Sheet](RUNBOOK.md#9-talking-point-cheat-sheet-one-pager).
+
+### Conceptual
+
+**Q: What's the difference between authentication and authorization?**
+A: **Authentication** = proving *who* you are (the PKCE flow proves the user is who they claim to be; the client credentials flow proves the agent is who it claims to be). **Authorization** = deciding *what* you're allowed to do (scope checks, role mappings, RLS). This demo does both, in distinct layers — auth at the control plane, authz at three tiers (§3).
+
+**Q: What's the difference between delegation and impersonation?**
+A: **Delegation** = agent acts on the user's behalf. The audit trail records both principal (user) and actor (agent). **Impersonation** = agent *becomes* the user; the trail shows only the agent, losing the connection back to who asked. This demo uses delegation via RFC 8693, which carries an `act` claim to preserve the principal/actor distinction. Impersonation is an anti-pattern for agent scenarios because you can't tell who triggered an action.
+
+**Q: Why OAuth and not SAML?**
+A: OAuth is for delegated API authorization — what an agent or web app needs to call APIs on a user's behalf. SAML is for browser-based SSO between an identity provider and a service. OAuth has richer token semantics (scopes, `act`, `jti`) that are well-suited to the agent scenario. For AI agents calling databases and APIs, OAuth (specifically OAuth 2.1 + RFC 8693) is the right tool.
+
+**Q: What's the difference between an ID token and an access token?**
+A: **ID token** = OIDC, proves user identity to the *client* (browser). It's consumed by the client and not forwarded. **Access token** = proves authorization to call *resource APIs*. It's forwarded with every API request. This demo issues access tokens only — the database doesn't need or want an ID token.
+
+**Q: Why three principals and not just "users" and "services"?**
+A: Because the delegated agent is *neither* — it acts on behalf of a user (so it's not a pure service) but executes actions itself (so it's not the user). Collapsing it into either category loses the audit trail. The three-principal model makes the principal/actor distinction first-class — see §2.
+
+### Technical
+
+**Q: Why JWTs and not opaque tokens?**
+A: JWTs are self-contained. The database (or any service) can verify them locally with the public key from JWKS — no network callback to the control plane. Opaque tokens are random strings that require an introspection call to the AS on every request, which would mean the database trusts whatever the control plane says at request time. JWTs make identity *cryptographically verifiable*, not *trusted*.
+
+**Q: Why scopes and not roles directly in the token?**
+A: Scopes are fine-grained permissions (`read:transactions`, `write:transactions`). Roles are *bundles* of scopes (`senior_analyst` = R+W). Putting scopes in the token — and roles in a database table — lets you do scope intersection cleanly during token exchange (`effective = subject.scopes ∩ agent.default_scopes`, see §7.2) without re-issuing tokens when role definitions change.
+
+**Q: What stops an agent from claiming a different actor identity?**
+A: Two things. (1) The control plane verifies the actor exists in `platform.agents` and has `is_delegatable=TRUE` before issuing a token. (2) The web app only requests delegation for agents registered in its own config — so a malicious LLM can't ask for `act=agent_ceo_with_full_access`. See `control-plane/app/routes/token.py:_grant_token_exchange`.
+
+**Q: How is this different from an API gateway that injects user ID into requests?**
+A: An API gateway injecting user identity is a *trust* mechanism — if the gateway is misconfigured or compromised, the wrong identity propagates everywhere. RS256 JWTs are a *cryptographic* mechanism — every layer verifies the signature independently. The database doesn't have to trust the web app or the gateway; it verifies the token itself. Trust assumptions scale linearly with components; cryptographic verification scales with the key strength.
+
+**Q: Why not use OPA (Open Policy Agent) instead of Postgres RLS?**
+A: OPA is excellent for centralized policy across many services with Rego DSL. Postgres RLS is excellent for row-level enforcement with low latency in the database itself. They're complementary. This demo uses RLS because the database is the last line of defense for *row-level* access — and pushing every row check to an external service adds latency and a network dependency. In production, OPA and RLS often coexist: OPA for service-level authz, RLS for data-level authz.
+
+**Q: Why not pass user identity as a query parameter?**
+A: Three reasons (see §3 "Postgres RLS via GUCs"): (1) query parameters can be tampered with via SQL injection even with parameterization — GUCs are set server-side, not in SQL text; (2) GUCs don't appear in `pg_stat_statements` or query logs, so identity doesn't leak; (3) `SET LOCAL` is transaction-scoped, safe under connection pooling.
+
+**Q: What's the latency overhead of JWT verification + DB roundtrip?**
+A: RS256 signature verification with a cached JWKS is ~0.1ms. A Postgres `SET LOCAL` + simple query is ~0.5ms. Total overhead is under 1ms per request — invisible in any real API. JWKS caching matters more than the verification itself; the web app caches the JWKS and refreshes on `kid` miss.
+
+**Q: Can the LLM forge a request to bypass RLS?**
+A: No. The LLM doesn't have database credentials, network access, or any way to issue raw SQL. Every LLM tool call goes through the web app, which calls `run_with_identity(sub, act.sub, scope)` before executing the query. RLS sees the agent's identity regardless of what the LLM asks for. Even if the LLM emits a perfectly crafted SQL string, it can't bypass the GUCs the application sets.
+
+**Q: How do I rotate the signing key?**
+A: (1) Generate a new RSA keypair (`scripts/gen_keys.py` updated to output a new key). (2) Add the new public key to JWKS with a new `kid`. (3) Restart the control plane to start signing new tokens with the new private key. (4) Leave the old key in JWKS for the cache TTL (~hours) so existing tokens still verify. (5) Remove the old key. JWKS supports multiple keys at once, so rotation is graceful. Production should automate this with a KMS.
+
+### Operational
+
+**Q: How do I add a new agent?**
+A: `INSERT INTO platform.agents (agent_id, default_scopes, is_delegatable) VALUES (...)`. The control plane picks it up immediately. No restart needed (the agents service reads from the DB on each token exchange).
+
+**Q: How do I add a new role?**
+A: `INSERT INTO platform.roles (role, description) VALUES (...)` plus rows in `platform.role_scopes` mapping the role to scopes. Users in that role get the new scopes on their next token issuance (or next refresh).
+
+**Q: How do I add a new scope (e.g., `delete:transactions`)?**
+A: (1) Define the RLS policy in `init.sql` to permit the new scope. (2) Add the scope string to `platform.role_scopes` for human roles that should have it. (3) Add it to `platform.agents.default_scopes` for any agents allowed to use it. (4) Add the scope to the web app's tool definitions.
+
+**Q: How do I revoke all tokens for a user?**
+A: `UPDATE platform.token_records SET revoked=TRUE WHERE sub='user_123' AND revoked=FALSE`. This kills all live access tokens and refresh tokens for that user. Their next refresh will fail; their active sessions will return 401 on the next request. To also force logout: clear the web app session (it's a cookie, so it'll naturally expire) and rotate the user's password.
+
+**Q: What happens if Postgres is down?**
+A: The control plane can't verify users or write audit records (token issuance fails). The web app can't verify tokens (JWKS check requires the DB to look up `jti` revocation status — or you move this to local-only verification by trusting the JWT signature + short TTL). The cli-agent can't do anything (it's pure DB). This is the standard "no DB = no auth" model — there's no offline bypass by design. Production adds read replicas, connection pooling with timeouts, and circuit breakers.
+
+**Q: How do I scale this?**
+A: The web app is stateless — scale horizontally behind a load balancer. The control plane is mostly stateless (auth codes and refresh tokens are in-memory in this demo; move to Redis/DB for production to scale horizontally). Postgres scales vertically and via read replicas. The bottleneck in production will be the DB — token_records and audit_log are write-heavy, so partition by time and archive old rows.
+
+### Comparison
+
+**Q: How does this compare to AWS IAM roles for service accounts (IRSA)?**
+A: Similar pattern. AWS IRSA lets a pod exchange its Kubernetes service account token for an AWS session token. The difference: IRSA's exchange is one-way — the resulting AWS credentials don't carry the original K8s identity. This demo's RFC 8693 exchange keeps the original principal (`sub`) AND adds the actor (`act.sub`), so every action is attributable to both. For audit-heavy agent scenarios, keeping both identities is the win.
+
+**Q: How does this compare to Google Cloud Workload Identity Federation?**
+A: GCP WIF lets a workload outside GCP (e.g., GitHub Actions) exchange its OIDC token for a short-lived GCP access token. Like IRSA, it's a one-way federation: the GCP token doesn't carry the original principal. GCP then enforces IAM based on the impersonated service account. This demo's approach is similar in *spirit* but preserves principal → actor attribution through every layer.
+
+**Q: How does this compare to SPIFFE/SPIRE?**
+A: SPIFFE issues SVIDs — cryptographically attested workload identities that prove "this binary on this host is service X." It's complementary, not competitive. You could use SPIFFE for the *agent's* identity (replacing the headless client_credentials flow) and OAuth for the *user's* identity, with this demo's RFC 8693 exchange combining them. SPIFFE is at the workload layer; OAuth is at the user/agent layer. Many production systems use both.
+
+**Q: How does this compare to OIDC + custom claims?**
+A: OIDC custom claims are how most apps encode roles (`groups: ["senior_analyst"]` in the ID token). That works for *first-party* access — the same IdP and the same app. This demo's RFC 8693 model works for *third-party delegation* — the user's IdP issues the token, the agent's authorization server issues a new token, and the resource server (the database) verifies both. OIDC alone can't express the principal/actor distinction cleanly because it was designed for browser SSO, not API-to-API delegation.
+
+### Practical
+
+**Q: What's the smallest piece I could lift out for my own project?**
+A: The `app_session` role + RLS policies in `db/init.sql`. That's the "last line of defense" pattern in ~50 lines of SQL. Add JWT issuance later (any library works — this demo's control plane is ~700 lines if you want to study it). Most projects start with just RLS and an upstream auth check, then add OAuth when they need multi-app or delegated-agent support.
+
+**Q: What are the most common pitfalls when implementing this pattern?**
+A:
+1. **Forgetting `SET LOCAL` resets** → identity leaks between pooled requests. Always wrap in a transaction.
+2. **Connecting as a superuser** → RLS is bypassed. Verify with `SELECT current_user, session_user;` after connecting.
+3. **Putting user identity in SQL parameters** → SQL injection risk, log leakage. Use GUCs.
+4. **Long-lived tokens (24h+ access, 30d refresh)** → defeats revocation. Use 1h access + 8h refresh max.
+5. **Skipping PKCE** ("we're not a public client") → auth code interception still possible via misconfigured redirect URIs.
+6. **Hardcoding agent scopes in code** instead of `platform.agents.default_scopes` → can't change without redeploy.
+7. **No audit log writes on RLS blocks** → silent failures look like bugs instead of attacks.
+8. **Issuing tokens without an audience claim** → tokens can be replayed against other APIs in your trust domain.
+
+**Q: When is this pattern overkill?**
+A: Single-user internal tools with no agent integration. Static read-only dashboards. Anything where the threat model doesn't include "compromised service," "agent privilege escalation," or "audit requirement." For those, a simple session cookie + role check at the app layer is fine. This pattern earns its complexity when you have **multiple principal types**, **delegated agents**, or **regulatory audit requirements**.
+
+**Q: How do I test this?**
+A: `make test` runs the verification suite (30+ scenarios). For new tests, the pattern is: (1) trigger an action, (2) query `platform.audit_log` to confirm the right event was recorded, (3) query the data table to confirm RLS allowed/denied as expected. The smoke test in RUNBOOK §4 is a good starting point.
+
+## 10. Audit & Observability
 
 ### `platform.audit_log`
 
@@ -251,7 +647,7 @@ cli-agent/web-app   Control-Plane        identity-db
 - Web UI polls `/api/audit-feed` every 3s → renders last 10 entries
 - Web UI polls `/api/headless-feed` every 3s → renders last 10 cli-agent LLM turns
 
-## 8. Security Properties
+## 11. Security Properties
 
 | Property | Implementation |
 |---|---|
@@ -266,7 +662,30 @@ cli-agent/web-app   Control-Plane        identity-db
 | **Revocation** | `POST /oauth/revoke` (RFC 7009); tokens tracked in `platform.token_records.revoked` |
 | **Audit completeness** | Token events, RLS blocks, and LLM turns all logged |
 
-## 9. Non-Goals & Known Limitations
+## 12. Glossary
+
+Terms used throughout this document, with the precise meaning intended here.
+
+| Term | Definition |
+|---|---|
+| **Principal** | The entity ultimately responsible for an action. In the JWT, this is the `sub` claim. A human user is the principal of their own actions; a headless agent is its own principal. |
+| **Actor** | The entity that actually executed the action on behalf of the principal (if different). In RFC 8693, this is the `act.sub` claim. In this demo, only the delegated agent has an actor distinct from the principal — and in that case, the human is the principal, the agent is the actor. |
+| **Delegation** | The act of a principal granting an actor the right to act on their behalf with (typically) reduced permissions. Modeled here by RFC 8693 token exchange. |
+| **Downscoping** | Reducing a token's permissions to the intersection of the subject's allowed scopes and the actor's allowed scopes. A read-only copilot cannot be granted a write scope even if the human user has it. |
+| **Scope** | A named permission, e.g., `read:transactions`, `write:transactions`. Issued by the control plane and bound to a JWT at issuance. Enforced by both the web app (token scope check) and the database (RLS). |
+| **Role** | A named bundle of scopes assigned to a human user (e.g., `senior_analyst` → R+W; `junior_analyst` → R). Roles live in `platform.roles` and `platform.role_scopes`. Roles only apply to human users — agents get scopes directly from `platform.agents.default_scopes`. |
+| **RS256** | RSA-SHA256 signing algorithm for JWTs. Asymmetric: the control plane signs with a private key, the web app verifies with the public key published at `/.well-known/jwks.json`. |
+| **JWKS** | JSON Web Key Set — a JSON document listing the public keys an issuer uses to sign JWTs. Standardized location: `/.well-known/jwks.json`. The web app caches this and uses it to verify every incoming token. |
+| **PKCE** | Proof Key for Code Exchange (RFC 7636). A cryptographic binding between an authorization request and its token exchange. Prevents authorization code interception. This demo enforces S256 only. |
+| **GUC** | Grand Unified Configuration — a Postgres session variable (e.g., `app.user_id`). This demo uses `SET LOCAL` to populate `app.user_id` and `app.actor_id` at the start of each transaction; RLS policies read them via `current_setting()`. |
+| **RLS** | Row-Level Security — Postgres feature where policies on a table filter which rows are visible to (or modifiable by) which connections. The database connection role (`app_session`) is non-superuser, so RLS is always enforced. |
+| **JTI** | JWT ID — a unique identifier per issued token. Tracked in `platform.token_records` so the control plane can revoke specific tokens (RFC 7009). |
+| **Refresh token rotation** | OAuth 2.1 pattern: every refresh of an access token issues a new refresh token and revokes the old one. Limits the blast radius of a stolen refresh token. |
+| **M2M** | Machine-to-machine — the pattern where a service authenticates as itself, not on behalf of a user. In this demo, the headless agent uses M2M via the client credentials grant. |
+| **Attenuation** | Another word for downscoping, used in the demo's talking points: "scope attenuation, not blanket-deny." |
+| **app_session** | The Postgres role used by the web app and cli-agent to run queries. Non-superuser, so RLS is enforced. A separate `control_plane_admin` role exists for schema migrations and audit-log writes. |
+
+## 13. Non-Goals & Known Limitations
 
 This is a **demo**. The following are explicitly out of scope:
 
@@ -281,7 +700,75 @@ This is a **demo**. The following are explicitly out of scope:
 - **No policy versioning** — `platform.role_scopes` and `platform.agents.default_scopes` are mutable; no audit of who changed them when.
 - **No delegation chains** — user → agent → sub-agent is not modeled. The `act` claim can technically be nested but our code only supports one level.
 
-## 10. File Map
+## 14. External IDP Integration (Future Enhancement)
+
+This demo ships with a **custom OAuth 2.1 control plane** as the authorization server. That's deliberate — it lets you read every line of the token-issuance code and understand exactly what's happening. In production, you'd almost always replace the control plane with a hosted IDP.
+
+### What changes, what stays the same
+
+| Layer | Today (custom control plane) | Production (external IDP) |
+|---|---|---|
+| Authorization server | `control-plane/` (FastAPI, custom) | Okta / Auth0 / Keycloak / etc. |
+| User login UI | `control-plane/app/templates/login.html` | IDP's hosted login page (or your own UI calling IDP's APIs) |
+| Client registration | `platform.clients` table | IDP's dashboard or API |
+| Role → scope mapping | `platform.roles` + `platform.role_scopes` | IDP groups / claim mapping |
+| Signing keys | `control-plane/keys/signing.pem` (RS256) | IDP's JWKS endpoint |
+| Auth-event audit log | `platform.audit_log` (token_*) | IDP's event log (typically exportable via API) |
+| **Web app OAuth client** | Unchanged — already a standard OAuth 2.1 client |
+| **Postgres RLS + GUC pattern** | Unchanged — still the last line of defense |
+| **Application audit log** | Unchanged — `platform.audit_log` (rls_block, llm_log) |
+
+The swap-out is mostly configuration: point the web app at the IDP's issuer URL, register a client, map IDP groups to your application's roles. The cryptographic-identity story, the three-tier authorization, the audit trail, and the RLS enforcement are all unaffected.
+
+### Concrete migration: custom → Okta
+
+1. **In Okta**: create an OIDC web app for the web-app. Enable grant types `Authorization Code + PKCE` and `Token Exchange` (RFC 8693). Create a separate service app for the headless agent with grant type `Client Credentials`.
+2. **In Okta**: define a groups → claim mapping so the user's role (e.g., `senior_analyst`) becomes a `groups` claim in the access token. Configure token-exchange policy to allow web-app → delegated agent.
+3. **In the web app**: change `OIDC_ISSUER` from `http://control-plane:18080` to `https://your-tenant.okta.com/oauth2/default`. The web app's existing OAuth client code (already PKCE + token-exchange-aware) keeps working — it just talks to Okta now. Same for the headless agent's `OIDC_ISSUER` + client credentials.
+4. **Role mapping**: replace `platform.role_scopes` lookups with a small mapping from Okta `groups` claim → application scopes (e.g., `senior_analyst` group → `read:transactions write:transactions`).
+5. **Database schema stays identical.** The web app still does `SET LOCAL app.user_id, app.actor_id` before each query. RLS still enforces row + principal type. The audit log still distinguishes principal from actor.
+6. **Token verification stays identical.** The web app fetches the IDP's JWKS (same URL pattern, different issuer) and runs the same RS256 verification. Nothing else changes.
+
+### RFC 8693 support by IDP — does delegation work?
+
+Not every IDP supports token exchange. This matters because RFC 8693 is what enables the delegated-agent story.
+
+| IDP | RFC 8693 support | Notes |
+|---|---|---|
+| **Okta** | ✅ Yes (v1 API, `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`) | Best-supported major vendor; rich policy controls on which actors can be delegated to |
+| **Auth0** | ✅ Yes | Supports all token types (access, refresh, JWT); configurable per-client |
+| **Keycloak** | ✅ Yes | Native, configurable token-exchange flow with permission-based policies |
+| **Azure AD / Entra ID** | ⚠️ Partial | Microsoft's preferred delegation model is **On-Behalf-Of (OBO)**. RFC 8693 added more recently — verify the version |
+| **AWS Cognito** | ❌ No native support | Would need a custom broker service in front |
+| **Google Cloud IAM** | ❌ No | Uses Workload Identity Federation (OIDC token → GCP access token) instead — different model |
+| **HashiCorp Vault** | ⚠️ Limited | Vault issues tokens, but its model isn't a drop-in OAuth 2.1 server |
+
+**If your IDP doesn't support RFC 8693**, you have two options:
+
+1. **Stand up a thin token-exchange broker** — the `control-plane/` from this demo, scaled down to ~150 lines of code, in front of the IDP. It accepts the user's IDP-issued token + an actor claim, mints a delegated JWT with the `act` claim, and signs with its own key. The rest of the architecture (web app, RLS, GUCs, audit log) is completely unchanged.
+2. **Use the IDP's native delegation model.** Azure's OBO flow encodes delegation differently, but the `sub` + scope + audit story still works — you'd translate OBO claims into the same `app.user_id` / `app.actor_id` GUC pattern.
+
+### What you gain from the swap
+
+- **MFA, WebAuthn, adaptive auth** out of the box
+- **SAML federation** to enterprise IdPs (Active Directory, Okta-to-Okta, etc.)
+- **Directory integration** (LDAP, HRIS sync, SCIM provisioning)
+- **Compliance certifications** the IDP already holds (SOC2, FedRAMP, ISO 27001)
+- **Reduced attack surface** — no custom auth code to patch, no custom signing keys to rotate
+- **Geographic and high-availability** the IDP provides
+
+### What you keep
+
+- The three-principal model (human / delegated / headless)
+- The cryptographic identity story (RS256 JWTs, JWKS-verified by every layer)
+- The three-tier authorization (token scope → role mapping → RLS)
+- The audit trail (principal vs actor in every log line)
+- The GUC propagation pattern (`SET LOCAL` → RLS as the last line of defense)
+- The entire database layer unchanged — `db/init.sql` and `platform.audit_log` work with any IDP
+
+The demo's value isn't the custom control plane — it's the **end-to-end identity propagation story** that any OAuth 2.1 + RFC 8693 IDP can plug into.
+
+## 15. File Map
 
 ```
 .

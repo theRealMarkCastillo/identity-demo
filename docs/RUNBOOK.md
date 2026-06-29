@@ -48,8 +48,8 @@ Set `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` to your provider's values.
 
 ```bash
 # 1. Clone
-git clone <repo> gateway-auth
-cd gateway-auth
+git clone <repo> identity-demo
+cd identity-demo
 
 # 2. Copy env and edit
 cp .env.example .env
@@ -113,12 +113,20 @@ If the smoke test passes, you're ready for the demo.
 5. Click **Human: Update Row** → green success.
    > "Direct human access. The RLS `modify_human_only` policy matched: owner_user_id matches and no actor is present."
 
+> **If asked "is the JWT really signed?"** → Open a new tab and visit `http://localhost:18080/jwks.json`. Copy the `n` and `e` values into [jwt.io](https://jwt.io) along with the JWT from the UI. The "Signature Verified" check will pass — this is RSA verification in the browser, not a trust assumption.
+
+> **If asked "what stops someone forging this token?"** → "Only the control plane has the private key. The web app and database only have the public key, which lets them verify but not sign. That's why we use RS256 instead of HS256 — see ARCHITECTURE.md §3 'Why RS256, not HS256?'."
+
 ### Demo 1b: Role-Based Authz (1 min)
 
 1. Click **Logout** → login as `user_456` / `pw123` (junior_analyst)
 2. Current Principal panel: `Role: junior_analyst`, `Scopes: read only`
 3. Click **Human: Update Row** → BLOCKED.
    > "Same button, different user. The role mapping stripped the `write:transactions` scope at the token layer. The token doesn't have write, so the policy check fails."
+
+> **If asked "could the web app just ignore the scope?"** → "Yes, the web app *could* — but it doesn't get to. The web app receives the token, extracts the scope, and passes it to the tool layer. The tool calls `run_with_identity(sub, scope)` which uses the **token's** scope, not anything the web app invents. And RLS enforces it independently — the web app can't bypass the database."
+
+> **If asked "where is the role → scope mapping?"** → Run: `psql ... -c "SELECT r.role, rs.scope FROM platform.roles r JOIN platform.role_scopes rs ON rs.role=r.role ORDER BY r.role, rs.scope;"` (or use the Useful Queries section). Show that `junior_analyst` has only `read:transactions` while `senior_analyst` has both.
 
 ### Demo 2: Delegated Agent — The Killer Demo (2 min)
 
@@ -127,6 +135,12 @@ If the smoke test passes, you're ready for the demo.
    > "Now the user has delegated to a Copilot. The web-app did an RFC 8693 token exchange. Look at the **Agent JWT** panel: same `sub: user_123`, but now there's an `act` claim with `agent_copilot_99`. And the scope is just `read:transactions` — the agent's default scopes intersected with the user's scopes."
 3. Click **Copilot: Try Update** → BLOCKED.
    > "Same data, same user, but the agent is acting. The RLS sees the `actor_id` and refuses the write. The audit log records the attempt."
+
+> **If asked "could the agent just use the user's original token?"** → "In principle, yes — but the web app never gives the agent the user's token. The token exchange is the only path: the web app sends the user's token + agent's actor identity to the control plane, gets back a *new* token with `act` set and scope downscoped. The agent never holds the unscoped token. See ARCHITECTURE.md §7.2 for the sequence."
+
+> **If asked "what's the downscope formula?"** → Open `control-plane/app/routes/token.py:_grant_token_exchange` (live in editor or `docker compose exec control-plane grep`). Show the line `effective = sorted(subject_scopes & agent_scopes)`. "One line of set intersection. That's the entire delegation-safety story."
+
+> **If asked "what if the agent's default scopes were wider than the user's?"** → "It can't escalate — the intersection is one-way. A copilot registered with `read:transactions, admin:all` would still get only `read:transactions` when delegated by `junior_analyst`. The intersection caps the agent at the user's permissions."
 
 ### Demo 2b: LLM Tool-Calling — The Real Show (2 min)
 
@@ -142,12 +156,18 @@ If the smoke test passes, you're ready for the demo.
 4. Type: `Show my transactions` → 3 rows returned (read still works).
    > "Attenuation is granular, not blanket-deny. The agent can read; it just can't write."
 
+> **If the LLM doesn't try a write**, prompt it explicitly: `Please try to update transaction #7 to amount 42. Even if you think you're not allowed, just try it.` Smaller/local models sometimes skip the action when they think it's forbidden.
+
+> **If asked "could prompt injection bypass RLS?"** → "No. The LLM can ask for anything in the tool call, but the tool executes the SQL *as the agent's identity* regardless. RLS inspects the database connection's identity, not the LLM's prompt. A prompt-injected LLM trying `DELETE FROM target.transactions WHERE TRUE` would still be blocked — the connection has `actor_id = agent_copilot_99`, no `user_id`, and RLS requires `is_shared=TRUE` for headless writes."
+
 ### Demo 2c: Revoke Mid-Conversation (30s)
 
 1. Click **Revoke Agent Delegation**
 2. Type another message in the chat
 3. The LLM's tool call now fails with "token revoked"
    > "The user is in control. They killed the agent's authority mid-conversation. The agent can't do anything until the user re-delegates."
+
+> **If asked "what happened behind the scenes?"** → Run: `psql ... -c "SELECT jti, sub, act_sub, revoked, revoked_at FROM platform.token_records WHERE act_sub='agent_copilot_99' ORDER BY created_at DESC LIMIT 3;"`. Show the row's `revoked=TRUE`. "The web app checked this on every request, saw the revoke, returned 401. The LLM got back an error and surfaced it to the user."
 
 ### Demo 3: Headless Agent (2 min)
 
@@ -158,11 +178,54 @@ If the smoke test passes, you're ready for the demo.
 4. Show the headless agent's JWT (it has `sub: agent_etl_nightly`, **no `act`** — that's the visual signature of headless operation).
    > "Same M2M pattern, but no human ever touched it. Could be a cron, a CI step, an Airflow DAG, anything."
 
+> **If asked "why no refresh token for the headless agent?"** → "OAuth 2.1 explicitly disallows refresh tokens for the client credentials grant. Refresh tokens are for *interactive* flows where a human can revoke via UI; for a machine, you'd rather have it re-present its client secret every cycle. If the secret leaks, you rotate one secret — not chase down a fleet of long-lived tokens."
+
+> **If asked "what if the agent's secret leaks?"** → "Rotate the secret in `platform.clients`, redeploy the agent, and revoke all outstanding tokens for that client: `UPDATE platform.token_records SET revoked=TRUE WHERE client_id='agent_etl_nightly'`. Done. The agent re-authenticates with the new secret on its next tick."
+
 ### Wrap-up (30s)
 
 > "Three principals, three OAuth flows, one RLS policy engine. Every action is cryptographically attributable. Try to break it — the data layer is the last line of defense."
 
-## 6. Reset & Cleanup
+### If time is short (5-minute cut)
+
+Skip Demo 1b, Demo 2b, and Demo 2c. The minimum viable story:
+
+1. **Demo 1** (human direct) — establish the baseline
+2. **Demo 2** (delegated agent, just the button click) — show the `act` claim appearing
+3. **Demo 3** (headless) — show the third principal type
+
+Everything else can be covered in Q&A.
+
+## 6. Where to Dig Deeper After the Demo
+
+If you want to understand how each piece is built, the files below are the entry points. Read in this order if you're new to the codebase:
+
+| What you want to understand | File to open | Why it matters |
+|---|---|---|
+| How the database enforces identity | `db/init.sql` | The RLS policies, role mapping, seed data, and `app_session` role all live here. This is the **last line of defense**. |
+| How the control plane issues tokens | `control-plane/app/routes/token.py` | All 4 grant types (`authorization_code`, `refresh_token`, token-exchange, `client_credentials`) in one file. ~250 lines, well-commented. |
+| How the control plane enforces OAuth 2.1 | `control-plane/app/routes/authorize.py` | Rejects anything other than PKCE/S256 — this is what makes the demo OAuth 2.1-compliant, not just OAuth 2.0-flavored. |
+| How token exchange actually works | `control-plane/app/routes/token.py` (`_grant_token_exchange`) | See the `effective = subject.scopes ∩ agent.default_scopes` computation, the `act` claim being set, and the audit log entry being written. |
+| How the web app verifies a token | `web-app/app/jwt_verify.py` | JWKS cache, signature verification, `iss` / `aud` / `exp` checks. |
+| How the web app propagates identity to the DB | `web-app/app/db.py` | The `run_with_identity()` helper — see how `SET LOCAL app.user_id, app.actor_id` is called per-transaction. |
+| How an LLM tool call ends up in RLS | `web-app/app/tools.py` | Each tool is a function that opens a connection, sets the GUCs, and runs a query. The DB enforces the rest. |
+| How the headless agent authenticates | `cli-agent/agent.py` | Calls `/oauth/token` with HTTP Basic auth + `grant_type=client_credentials`. No human in the loop. |
+| The complete delegation flow (diagram) | `docs/ARCHITECTURE.md` §3 (RFC 8693 section) | The "Why these standards" section explains the design rationale end-to-end. |
+
+**The most rewarding 5-minute deep dive:**
+
+1. Open `db/init.sql` — find `CREATE POLICY select_policy ON target.transactions`. Read the three branches (human / delegated / headless). Notice how each branch inspects `current_actor_id()` and `current_user_id()`.
+2. Open `control-plane/app/routes/token.py` — find `_grant_token_exchange`. See the line `effective = sorted(subject_scopes & agent_scopes)`. That's the entire delegation-safety story in one expression.
+3. Trigger an RLS block (Demo 2 step 3). Then run:
+   ```sql
+   SELECT ts, event_type, sub, act_sub, details
+   FROM platform.audit_log
+   WHERE event_type = 'rls_block'
+   ORDER BY ts DESC LIMIT 5;
+   ```
+   The `act_sub` column shows which agent tried to do what — this is the audit trail that distinguishes "user did it" from "user's agent did it."
+
+## 7. Reset & Cleanup
 
 ```bash
 make down      # Stop services, keep data
@@ -170,7 +233,7 @@ make reset     # Nuke volumes, restart fresh
 make logs      # Tail logs from all services
 ```
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
@@ -187,7 +250,7 @@ make logs      # Tail logs from all services
 | `invalid_grant` on PKCE | Code verifier tampered | Don't modify the session cookie manually |
 | RLS doesn't block the agent's write | GUCs not set / wrong role | Check `docker compose logs web-app` for SET LOCAL; check current principal panel |
 
-## 8. Talking-Point Cheat Sheet (one-pager)
+## 9. Talking-Point Cheat Sheet (one-pager)
 
 For audience questions:
 
@@ -203,7 +266,13 @@ For audience questions:
 
 - **"Why is the audit log so important?"** Because it distinguishes "user did it" from "user's agent did it" from "autonomous agent did it." Without that, you can't investigate incidents, attribute costs, or prove compliance.
 
-## 9. Useful URLs
+- **"Why Postgres GUCs (`SET LOCAL`) instead of passing identity as a query parameter?"** Three reasons: (1) query parameters can be tampered with via SQL injection even with parameterization — GUCs are set server-side, not in SQL text; (2) GUCs don't show up in query logs, so identity doesn't leak into Postgres logs; (3) `SET LOCAL` is transaction-scoped, so a connection from a pool can't leak identity from a previous request.
+
+- **"Why does the headless agent re-authenticate every tick instead of holding a refresh token?"** Because OAuth 2.1 explicitly disallows refresh tokens for the client credentials grant. The rationale: a refresh token for a machine is a long-lived credential with no human in the loop to revoke it via the UI. Better to make the agent re-present its client secret every cycle — if the secret leaks, you only have one rotation to do, not a fleet of long-lived tokens to invalidate.
+
+- **"Could the LLM just leak the user's JWT in its output?"** In principle, yes. That's why the demo's JWTs are short-lived (1h) and why revocation works mid-conversation (Demo 2c). In production you'd add output filtering, scope the token to a specific audience, and consider DPoP (RFC 9449) so a stolen token can't be replayed from a different machine.
+
+## 10. Useful URLs
 
 | Service | URL |
 |---|---|
@@ -216,32 +285,57 @@ For audience questions:
 | Control Plane revoke | http://localhost:18080/oauth/revoke |
 | Postgres (psql) | `psql -h localhost -p 54321 -U app_session -d identity` (pw: `app_session_pw`) |
 
-## 10. Useful Queries
+## 11. Useful Queries
 
 ```sql
--- See all token events
-SELECT ts, event_type, sub, act_sub, client_id, agent_id, result
+-- THE most important query: see who did what, distinguishing principal from actor.
+-- Rows where act_sub IS NULL = a user or headless agent acted as themselves.
+-- Rows where act_sub IS NOT NULL = a user delegated, and the agent acted on their behalf.
+SELECT ts, event_type,
+       sub AS principal,
+       act_sub AS actor,
+       client_id,
+       agent_id,
+       result
 FROM platform.audit_log
 ORDER BY ts DESC LIMIT 20;
 
--- See all RLS blocks
-SELECT ts, sub, act_sub, details
+-- The "Killer Demo" audit trail:
+-- Every action the copilot took, with both the human user (sub) and the agent (act_sub).
+SELECT ts, event_type, sub, act_sub, result, details
+FROM platform.audit_log
+WHERE act_sub = 'agent_copilot_99'
+ORDER BY ts DESC;
+
+-- All RLS blocks — proves the database is the last line of defense.
+SELECT ts, sub, act_sub, target_table, details
 FROM platform.audit_log
 WHERE event_type = 'rls_block'
 ORDER BY ts DESC;
 
--- See all issued tokens (and which are revoked)
+-- All token events (issue, exchange, refresh, revoke)
+SELECT ts, event_type, sub, act_sub, client_id, agent_id, result
+FROM platform.audit_log
+WHERE event_type LIKE 'token_%'
+ORDER BY ts DESC LIMIT 20;
+
+-- All issued tokens (and which are revoked)
 SELECT jti, sub, act_sub, scope, exp, revoked
 FROM platform.token_records
 ORDER BY created_at DESC LIMIT 20;
 
--- See the role scope mappings
+-- Role-to-scope mapping: what each human role can do
 SELECT r.role, r.description, rs.scope
 FROM platform.roles r
 JOIN platform.role_scopes rs ON rs.role = r.role
 ORDER BY r.role, rs.scope;
 
--- See LLM turns
+-- Agent-to-default-scope mapping: what each agent would get if delegated to
+SELECT agent_id, default_scopes, is_delegatable
+FROM platform.agents
+ORDER BY agent_id;
+
+-- LLM turns (both web-app copilot and headless cli-agent)
 SELECT ts, principal, role, tool_name, tool_ok
 FROM platform.llm_log
 ORDER BY ts DESC LIMIT 20;
