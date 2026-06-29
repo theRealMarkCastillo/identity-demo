@@ -366,7 +366,7 @@ sequenceDiagram
     CP->>CP: Mint access JWT (RS256), generate refresh token
     CP->>DB: INSERT platform.token_records (jti, sub, scope, exp)
     CP->>DB: INSERT platform.audit_log (event=token_issue, sub=user)
-    CP-->>W: { access_token, refresh_token, scope }
+    CP-->>W: access_token, refresh_token, scope
     W->>W: Store tokens in signed session cookie (itsdangerous)
     W-->>U: 302 redirect → /dashboard
 ```
@@ -393,10 +393,10 @@ sequenceDiagram
     CP->>CP: Mint NEW JWT (sub=user, act.sub=agent, scope=effective)
     CP->>DB: INSERT platform.token_records (jti, sub=user, act_sub=agent)
     CP->>DB: INSERT platform.audit_log (event=token_exchange, sub=user, act_sub=agent)
-    CP-->>W: { access_token, issued_token_type=jwt, scope }
+    CP-->>W: access_token, issued_token_type=jwt, scope
     W->>DB: BEGIN
     W->>DB: SET LOCAL app.user_id = <user><br/>SET LOCAL app.actor_id = <agent>
-    W->>DB: <tool query> — RLS enforces "delegated read-only on user's rows"
+    W->>DB: (tool query) — RLS enforces delegated read-only on user's rows
     DB-->>W: result or BLOCKED
     W->>DB: COMMIT (GUCs reset)
 ```
@@ -421,10 +421,10 @@ sequenceDiagram
     CP->>CP: Mint JWT (sub=agent_id, scope=effective, NO act claim)
     CP->>DB: INSERT platform.token_records (jti, sub=agent)
     CP->>DB: INSERT platform.audit_log (event=token_issue_principal=agent)
-    CP-->>A: { access_token, scope, expires_in }
+    CP-->>A: access_token, scope, expires_in
     A->>DB: BEGIN
     A->>DB: SET LOCAL app.user_id = '' (NULL)<br/>SET LOCAL app.actor_id = <agent>
-    A->>DB: <tool query> — RLS enforces "headless sees only shared rows"
+    A->>DB: (tool query) — RLS enforces headless sees only shared rows
     DB-->>A: result or BLOCKED
     A->>DB: COMMIT (GUCs reset)
 ```
@@ -436,19 +436,19 @@ This is what the web app does **before trusting any token** — it never calls b
 ```mermaid
 sequenceDiagram
     autonumber
-    participant C as Client (browser/agent)
+    participant C as Client (browser or agent)
     participant W as Web App
-    participant JWKS as /.well-known/jwks.json
+    participant JWKS as JWKS endpoint
     participant DB as Postgres
 
-    C->>W: Request + Authorization: Bearer <jwt>
+    C->>W: Request + Authorization Bearer <jwt>
     W->>JWKS: GET jwks.json (cached; refresh on miss)
-    JWKS-->>W: { keys: [{ kid, kty, n, e, alg }] }
+    JWKS-->>W: keys array with kid, kty, n, e, alg
     W->>W: Verify RS256 signature with public key (kid match)
     W->>W: Verify iss == identity-control-plane
     W->>W: Verify aud == target-api
     W->>W: Verify exp > now (and iat < now)
-    W->>W: Extract claims: sub, scope, act?, client_id, jti
+    W->>W: Extract claims: sub, scope, act, client_id, jti
     W->>DB: SELECT jti FROM platform.token_records WHERE jti=? AND revoked=FALSE
     DB-->>W: row (active) or NULL (revoked)
     alt Token revoked or invalid
@@ -456,7 +456,7 @@ sequenceDiagram
     end
     W->>W: Open transaction, call run_with_identity(sub, act.sub, scope)
     W->>DB: SET LOCAL app.user_id, app.actor_id
-    W->>DB: <tool query>
+    W->>DB: (tool query)
     DB-->>W: result
 ```
 
@@ -482,8 +482,8 @@ sequenceDiagram
     end
     W->>DB: UPDATE target.transactions SET amount=9999 WHERE id=1
     DB->>DB: RLS policy modify_human_only runs<br/>(actor_id is set → REJECTED)
-    DB-->>W: ERROR: new row violates row-level security policy
-    W->>DB: <write to platform.audit_log event=rls_block>
+    DB-->>W: ERROR new row violates row-level security policy
+    W->>DB: INSERT platform.audit_log event=rls_block
     DB-->>W: audit recorded
     W->>DB: COMMIT (or ROLLBACK — GUCs reset)
 ```
@@ -513,8 +513,8 @@ sequenceDiagram
     W->>W: Verify signature, iss, aud, exp — still valid
     W->>DB: SELECT jti FROM platform.token_records WHERE jti=? AND revoked=FALSE
     DB-->>W: NULL (revoked)
-    W-->>A: 401 Unauthorized {error: "token revoked"}
-    A->>U: "I lost authorization mid-conversation. Please re-delegate."
+    W-->>A: 401 Unauthorized — token revoked
+    A->>U: I lost authorization mid-conversation. Please re-delegate.
 ```
 
 ## 8. Threat Model
