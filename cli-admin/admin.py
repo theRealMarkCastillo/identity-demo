@@ -22,6 +22,7 @@ import sys
 import bcrypt
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 
 def _dsn() -> str:
@@ -307,6 +308,131 @@ def cmd_token_revoke_all(args):
 
 
 # ============================================================================
+# Column masking policies
+# ============================================================================
+
+VALID_MASK_TYPES = {"full", "partial", "hash", "null"}
+
+
+def cmd_column_policy_list(args):
+    with _conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("""
+            SELECT table_name, column_name, mask_type, mask_params, min_scope, description
+            FROM platform.column_policies
+            ORDER BY table_name, column_name
+        """)
+        rows = cur.fetchall()
+    if not rows:
+        print("(no column policies registered)")
+        return
+    print(f"{'TABLE':<22} {'COLUMN':<12} {'MASK':<10} {'PARAMS':<25} {'MIN SCOPE (raw)':<25} DESCRIPTION")
+    print("-" * 130)
+    for r in rows:
+        params = r["mask_params"] if r["mask_params"] else ""
+        desc = (r["description"] or "")[:40]
+        print(
+            f"{r['table_name']:<22} {r['column_name']:<12} {r['mask_type']:<10} "
+            f"{str(params):<25} {r['min_scope']:<25} {desc}"
+        )
+
+
+def cmd_column_policy_add(args):
+    if args.mask_type not in VALID_MASK_TYPES:
+        print(f"ERROR: mask_type must be one of {sorted(VALID_MASK_TYPES)}")
+        sys.exit(1)
+    params = None
+    if args.params:
+        try:
+            params = json.loads(args.params)
+        except json.JSONDecodeError as e:
+            print(f"ERROR: --params must be valid JSON: {e}")
+            sys.exit(1)
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO platform.column_policies
+                 (table_name, column_name, mask_type, mask_params, min_scope, description)
+               VALUES (%s, %s, %s, %s, %s, %s)
+               ON CONFLICT (table_name, column_name) DO UPDATE SET
+                 mask_type   = EXCLUDED.mask_type,
+                 mask_params = EXCLUDED.mask_params,
+                 min_scope   = EXCLUDED.min_scope,
+                 description = EXCLUDED.description""",
+            (args.table, args.column, args.mask_type,
+             Jsonb(params) if params else None,
+             args.min_scope, args.description or ""),
+        )
+        _audit(cur, "admin_column_policy_add", {
+            "table": args.table, "column": args.column, "mask_type": args.mask_type,
+            "mask_params": params, "min_scope": args.min_scope,
+        })
+        conn.commit()
+    print(
+        f"Added policy: {args.table}.{args.column} → {args.mask_type} "
+        f"(min_scope={args.min_scope})"
+    )
+
+
+def cmd_column_policy_update(args):
+    updates = {}
+    audit_changes = {}  # human-readable copy for the audit log
+    if args.mask_type is not None:
+        if args.mask_type not in VALID_MASK_TYPES:
+            print(f"ERROR: mask_type must be one of {sorted(VALID_MASK_TYPES)}")
+            sys.exit(1)
+        updates["mask_type"] = args.mask_type
+        audit_changes["mask_type"] = args.mask_type
+    if args.params is not None:
+        try:
+            parsed = json.loads(args.params)
+        except json.JSONDecodeError as e:
+            print(f"ERROR: --params must be valid JSON: {e}")
+            sys.exit(1)
+        updates["mask_params"] = Jsonb(parsed)
+        audit_changes["mask_params"] = parsed
+    if args.min_scope is not None:
+        updates["min_scope"] = args.min_scope
+        audit_changes["min_scope"] = args.min_scope
+    if args.description is not None:
+        updates["description"] = args.description
+        audit_changes["description"] = args.description
+    if not updates:
+        print("nothing to update (specify --mask-type/--params/--min-scope/--description)")
+        return
+    sets = ", ".join(f"{k} = %s" for k in updates)
+    params_list = list(updates.values())
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"UPDATE platform.column_policies SET {sets} "
+            "WHERE table_name = %s AND column_name = %s",
+            (*params_list, args.table, args.column),
+        )
+        if cur.rowcount == 0:
+            print(f"policy for {args.table}.{args.column} not found")
+            return
+        _audit(cur, "admin_column_policy_update", {
+            "table": args.table, "column": args.column, "changes": audit_changes,
+        })
+        conn.commit()
+    print(f"Updated policy: {args.table}.{args.column}")
+
+
+def cmd_column_policy_delete(args):
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM platform.column_policies WHERE table_name = %s AND column_name = %s",
+            (args.table, args.column),
+        )
+        if cur.rowcount == 0:
+            print(f"policy for {args.table}.{args.column} not found")
+            return
+        _audit(cur, "admin_column_policy_delete", {
+            "table": args.table, "column": args.column,
+        })
+        conn.commit()
+    print(f"Deleted policy: {args.table}.{args.column}")
+
+
+# ============================================================================
 # argparser
 # ============================================================================
 
@@ -362,6 +488,31 @@ def build_parser() -> argparse.ArgumentParser:
     pcr = pcs.add_parser("rotate-secret", help="rotate a client's BCrypt secret")
     pcr.add_argument("client_id")
     pcr.set_defaults(func=cmd_client_rotate_secret)
+
+    # column policies
+    pcp = sub.add_parser("column-policy", help="manage column-level masking policies")
+    pcps = pcp.add_subparsers(dest="subcmd", required=True)
+    pcps.add_parser("list", help="list all column policies").set_defaults(func=cmd_column_policy_list)
+    pcpa = pcps.add_parser("add", help="add or update a column policy")
+    pcpa.add_argument("table")
+    pcpa.add_argument("column")
+    pcpa.add_argument("--mask-type", required=True, choices=sorted(VALID_MASK_TYPES))
+    pcpa.add_argument("--params", help="mask params JSON, e.g. '{\"visible_tail\": 4}'")
+    pcpa.add_argument("--min-scope", required=True, help="scope required to bypass mask (e.g. read:transactions.full)")
+    pcpa.add_argument("--description", default="")
+    pcpa.set_defaults(func=cmd_column_policy_add)
+    pcpu = pcps.add_parser("update", help="update an existing column policy")
+    pcpu.add_argument("table")
+    pcpu.add_argument("column")
+    pcpu.add_argument("--mask-type", choices=sorted(VALID_MASK_TYPES))
+    pcpu.add_argument("--params", help="mask params JSON")
+    pcpu.add_argument("--min-scope", help="scope required to bypass mask")
+    pcpu.add_argument("--description")
+    pcpu.set_defaults(func=cmd_column_policy_update)
+    pcpd = pcps.add_parser("delete", help="delete a column policy")
+    pcpd.add_argument("table")
+    pcpd.add_argument("column")
+    pcpd.set_defaults(func=cmd_column_policy_delete)
 
     # tokens
     pt = sub.add_parser("token", help="manage tokens")

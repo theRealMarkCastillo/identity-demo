@@ -8,13 +8,13 @@ If you're new to the demo, read in this order:
 2. **The Three Principals (§2)** — the mental model: human / delegated agent / headless agent.
 3. **Design Decisions: Why These Standards (§3)** — *why* OAuth 2.1, RFC 8693, PKCE, JWT+JWKS, RLS via GUCs, three-tier authz, separate AS, RS256, and a non-superuser DB role.
 4. **System Components (§4)** — the moving pieces and how they connect.
-5. **Token Lifecycle (§5)**, **Identity Propagation (§6)**, **OAuth Flows (§7)** — the mechanics, in order of depth. §7 has six Mermaid sequence diagrams including JWT verification, RLS enforcement, and revocation.
+5. **Token Lifecycle (§5)**, **Identity Propagation (§6)**, **Column-Level Masking (§6.5)**, **OAuth Flows (§7)** — the mechanics, in order of depth. §7 has six Mermaid sequence diagrams including JWT verification, RLS enforcement, and revocation. §6.5 extends defense-in-depth from rows to cells.
 6. **Threat Model (§8)**, **FAQ (§9)** — explicit enumeration of what this demo defends against, plus 25+ Q&As on concepts, tech, ops, comparisons, and pitfalls.
 7. **Audit & Observability (§10)**, **Security Properties (§11)** — the verification story.
 8. **Glossary (§12)**, **Non-Goals (§13)**, **External IDP Integration (§14)**, **File Map (§15)** — reference material.
 9. **[PRODUCTION_PATTERNS.md](PRODUCTION_PATTERNS.md)** — the companion doc on adopting this pattern in production and building products for AI agents. Read it when you stop asking "how does this work" and start asking "how do I deploy / build with it."
 
-The Glossary (§12) defines every term used throughout (principal, actor, GUC, downscoping, etc.). Skip ahead to it whenever a term is unfamiliar. §14 explains how to swap the custom control plane for Okta/Auth0/Keycloak/etc. in production, including an RFC 8693 support matrix.
+The Glossary (§12) defines every term used throughout (principal, actor, GUC, downscoping, umask, etc.). Skip ahead to it whenever a term is unfamiliar. §14 explains how to swap the custom control plane for Okta/Auth0/Keycloak/etc. in production, including an RFC 8693 support matrix.
 
 ## 1. Purpose
 
@@ -384,6 +384,106 @@ USING (
 
 Even if all three were bypassed, the database itself rejects unauthorized actions.
 
+### Column-level masking: extending defense-in-depth from rows to cells
+
+RLS decides **which rows** a principal can see. Column-level masking decides
+**which cells** within those rows come back raw versus transformed. The two
+mechanisms are independent: an attacker who bypasses RLS still sees masked
+values, and a configuration mistake on the mask side still respects RLS.
+
+#### The push-down pattern
+
+The decision of "raw vs masked" is made once, at the control plane, when the
+token is minted. The decision flows down as part of the JWT to the database:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant CP as Control Plane
+    participant WA as Web App
+    participant DB as Postgres
+
+    U->>CP: Login / RFC 8693 exchange
+    CP->>CP: effective_scopes = role ∩ requested<br/>umask = compute_umask(effective, is_agent)
+    Note over CP: is_agent=True ⇒ umask='masked' (floor)<br/>else: any '.full' in effective ⇒ 'raw'
+    CP->>U: JWT (scope, umask claim)
+    WA->>DB: BEGIN
+    WA->>DB: SET LOCAL app.user_id, app.actor_id<br/>SET LOCAL app.unmask_level = umask
+    WA->>DB: SELECT * FROM target.transactions_masked
+    DB->>DB: apply_mask(col) per PII column<br/>RLS still filters rows first
+    Note over DB: If a PII column returns raw:<br/>INSERT audit_log (unmask_access)
+    DB-->>WA: masked or raw rows
+```
+
+#### Mask types and the registry
+
+`platform.column_policies` is the data layer for masking decisions, parallel
+to how `platform.role_scopes` is the data layer for role-to-scope mapping:
+
+| mask_type | Behavior | mask_params | Example |
+|---|---|---|---|
+| `full` | Return literal `'***'` | (none) | SSN |
+| `partial` | Return last N characters | `{"visible_tail": 4}` | card PAN → `****1111` |
+| `hash` | SHA256 + hex | (none) | email → `sha256:abc...` (deterministic per row) |
+| `null` | Return NULL | (none) | Reserved for secrets columns |
+
+A single PL/pgSQL function, `apply_mask(table_name, column_name, raw_value,
+row_pk)`, looks up the policy and dispatches on `mask_type`. Adding a new
+mask type means a single CASE branch in this function and a CHECK constraint
+update — no view changes, no recompilation.
+
+#### The principal-type floor
+
+Even if an agent's `default_scopes` contains `read:transactions.full`, three
+independent checks keep the agent from seeing raw values:
+
+1. **Control plane**: `roles.strip_full_suffix()` removes `.full` from any
+   scope in the agent's effective `scope` claim. The claim honestly reflects
+   what the agent can do.
+2. **Control plane**: `roles.compute_umask(..., is_agent=True)` forces
+   `umask='masked'` regardless of which scopes are in the effective set.
+3. **Database**: `apply_mask()` reads `app.unmask_level` and skips masking
+   only if it's the literal string `'raw'`. The web app reads this string
+   verbatim from the JWT's `umask` claim — there's no path through the
+   control plane that mints `'raw'` to a non-human principal.
+
+The three checks are redundant by design. Bypassing one still leaves two.
+
+#### The masked view
+
+All read tools query `target.transactions_masked` (a `security_barrier`
+view) instead of `target.transactions`. The view's `WITH
+(security_barrier=true)` clause ensures Postgres cannot push the WHERE
+clause past the `apply_mask()` call, which preserves RLS row filtering
+even when the planner might prefer otherwise. Writes still go to the base
+table directly because they don't return row data.
+
+#### Audit on raw access
+
+Whenever a PII column returns its raw value to a principal with raw
+clearance, `apply_mask()` writes one row to `platform.audit_log` with
+`event_type='unmask_access'`. Dedup is per `(table, row)` per query via a
+transaction-local GUC flag, so a single SELECT that returns three PII
+columns for six rows writes six audit rows — not eighteen.
+
+This is the compliance hook: `SELECT ts, sub, act_sub, details FROM
+platform.audit_log WHERE event_type='unmask_access'` answers "who saw raw
+PII, when, and what was exposed."
+
+#### Where every layer lives
+
+| Layer | Where | What changes | Touch cost |
+|---|---|---|---|
+| Scope → umask | `control-plane/app/services/roles.py` `compute_umask` | Code | Control plane redeploy |
+| Floor (strip `.full`) | `control-plane/app/services/roles.py` `strip_full_suffix` | Code | Control plane redeploy |
+| Mask policies | `platform.column_policies` (table) | Data (cli-admin) | None |
+| Mask function | `db/init.sql` `apply_mask` | Code | `make reset` |
+| Masked view | `db/init.sql` `target.transactions_masked` | Code | `make reset` |
+| Tools read the view | `web-app/app/tools.py` | Code | Web-app redeploy |
+| UI badge | `web-app/templates/dashboard.html` | Code | Web-app redeploy |
+| Audit | automatic via `apply_mask` | n/a | n/a |
+
 ### Policy catalog: where every authorization decision is defined
 
 This sub-section is the **map to the source of truth** for every "who can do what" rule in the system. If you're trying to answer "where is this policy defined?" or "what do I change to allow X?" — start here.
@@ -395,9 +495,21 @@ The row-level access logic is in SQL because the database is the last line of de
 | Policy | Location | What it enforces |
 |---|---|---|
 | `select_policy` | `db/init.sql:218` | SELECT for any principal type, scoped by `current_user_id()` / `current_actor_id()` |
-| `modify_human_only` | `db/init.sql:234` | INSERT/UPDATE/DELETE only when `current_actor_id() IS NULL` — agents can never write |
+| `modify_human_only` | `db/init.sql:234` | INSERT/UPDATE/DELETE only when `current_actor_id()` IS NULL — agents can never write |
 
 Both policies read `current_user_id()` and `current_actor_id()` — helper functions defined earlier in `init.sql` that wrap `current_setting('app.user_id')` and `current_setting('app.actor_id')`.
+
+#### Layer 1b: Column-level masking (SQL function + data table)
+
+Per-cell redaction on top of RLS. Two pieces:
+
+| Piece | Location | What it does |
+|---|---|---|
+| `apply_mask` function | `db/init.sql` (after RLS section) | PL/pgSQL dispatcher: looks up `platform.column_policies`, returns masked or raw based on `app.unmask_level` |
+| `target.transactions_masked` view | `db/init.sql` | Security-barrier view: selects through `apply_mask()` for every PII column; RLS on the base table still filters rows |
+| `platform.column_policies` table | `db/init.sql` (DDL + seed) | Data: one row per (table, column) describing its mask_type, params, and the `min_scope` required to bypass |
+
+The view is consulted by every read tool (`web-app/app/tools.py`). Writes still target the base table directly because they don't return row data.
 
 #### Layer 2: Role and agent scope data (rows in `platform.*` tables)
 
@@ -418,6 +530,8 @@ The control plane reads the data tables above and computes the **effective scope
 |---|---|---|
 | `control-plane/app/services/roles.py:7` | `get_role_scopes(role)` | Reads `platform.role_scopes` for a role |
 | `control-plane/app/services/roles.py:17` | `compute_effective_scopes(role, requested)` | `role_scopes ∩ requested` — the downscope formula for human users |
+| `control-plane/app/services/roles.py:24` | `compute_umask(scopes, is_agent)` | Returns `raw` iff any scope has `.full` AND `is_agent=False`; else `masked` (the principal-type floor) |
+| `control-plane/app/services/roles.py:31` | `strip_full_suffix(scopes)` | Removes `.full` from scope strings; applied to agent-issued tokens so the `scope` claim reflects what the agent can actually do |
 | `control-plane/app/services/agents.py` | `get_agent(agent_id)` | Reads `platform.agents.default_scopes` for token exchange |
 | `control-plane/app/routes/token.py` | grant handlers | Calls the above at issuance time for all four grant types |
 
@@ -431,6 +545,9 @@ The control plane reads the data tables above and computes the **effective scope
 | Change what an agent gets by default | `UPDATE platform.agents SET default_scopes = ...` | No |
 | Add a new scope string (e.g., `delete:transactions`) | 1) New RLS policy in `db/init.sql` <br> 2) Add to `platform.role_scopes` for human roles <br> 3) Add to `platform.agents.default_scopes` for agents <br> 4) Add to web app's tool definitions | **Yes** for (1) and (4) — `make reset` + web app redeploy. (2) and (3) are data changes. |
 | Change the downscope formula | `control-plane/app/services/roles.py` | **Yes** — control plane redeploy |
+| Change the principal-type floor (e.g., allow agents raw PII on a column) | `control-plane/app/services/roles.py` (`compute_umask`/`strip_full_suffix`) | **Yes** — control plane redeploy |
+| Add a new PII column with masking | 1) `ALTER TABLE target.<t> ADD COLUMN <c>`, populate <br> 2) `INSERT INTO platform.column_policies` <br> 3) Add `apply_mask(...)` call in the masked view <br> 4) `SELECT` the new column in `web-app/app/tools.py` | **Yes** for (3) and (4) — `make reset` + web app redeploy. (2) is data. |
+| Change a column's mask type or params | `UPDATE platform.column_policies` (or `cli-admin column-policy update`) | No — picked up on next query |
 | Change who can write at all | `db/init.sql` `modify_human_only` policy | **Yes** — `make reset` |
 | Revoke all tokens for a user | `UPDATE platform.token_records SET revoked=TRUE WHERE sub=...` | No — takes effect on next request |
 
@@ -641,6 +758,8 @@ This section enumerates the threats this demo defends against, the mechanism tha
 | **Headless agent accesses a specific user's rows** | RLS `current_user_id() IS NULL` branch. Headless agents only see rows where `is_shared=TRUE` — they cannot impersonate a user because there is no user `sub` to set. |
 | **Token theft via SQL injection** (attacker injects a different `sub` into a query) | Identity is set via Postgres GUCs, not query parameters. The SQL text never contains user identity — see §3 ("Postgres RLS via GUCs"). |
 | **Token theft via Postgres logs** | GUCs are session state, not in SQL text. They don't appear in `pg_stat_statements`, slow query log, or application logs. |
+| **Compromised agent reads raw PII** (SSN/PAN/email on a row it has RLS access to) | Principal-type floor: `compute_umask(..., is_agent=True)` always returns `'masked'`. Even if an agent's `default_scopes` contains `read:transactions.full`, the floor strips `.full` from the effective `scope` claim and forces `umask='masked'`. Three redundant checks at control plane, token layer, and DB (`apply_mask` reads `app.unmask_level`) — see §6.5. |
+| **Compromised human role escalation** (a junior_analyst somehow gets `read:transactions.full` in their effective scope) | Role mapping is the only path to `.full`. If you can add to `platform.role_scopes` you can already mint tokens at will; this is "compromise of a privileged account," which is out of scope (see below). The `apply_mask` policy lookup would also begin returning raw values, which the audit trigger (`event_type='unmask_access'`) would surface. |
 | **Cross-tenant data leak** (request from user A inherits identity from a previous user B) | `SET LOCAL` is transaction-scoped. After commit/rollback, GUCs reset. Connection pool can't leak identity between requests — see §3. |
 | **LLM hallucinates a destructive action** | Tool calls run with the agent's identity. RLS rejects writes. The attempt is logged to `platform.audit_log` and surfaced in the UI as a BLOCKED result — see §10. |
 | **User keeps an agent running after changing their mind** | RFC 7009 revocation. The user clicks "Revoke Agent Delegation"; the control plane flips `revoked=TRUE` on the `jti`; the web app's revocation check rejects the next request — see §7.6. |
@@ -670,8 +789,10 @@ These are real threats, but they're explicitly out of scope. Each is mitigated i
 Even within what this demo *does* defend, there are still residual risks:
 
 - **The control plane's `client_secret` for the web app and headless agent are in `.env`.** Anyone with read access to the repo in production can rotate those. This is a demo-scope concern, not a design flaw — production uses a secrets manager.
-- **The audit log is only as trustworthy as the database.** If the DB itself is compromised (admin-level access), the audit log can be rewritten. Mitigated by the INSERT-only / append-only approaches listed above.
+- **The audit log is only as trustworthy as the database.** If the DB itself is compromised (admin-level access), the audit log can be rewritten. Mitigated by the INSERT-only / append-only approaches listed above. The `unmask_access` rows that prove "who saw raw PII" share this trust assumption with the rest of the log.
 - **The LLM may not always attempt a write** during the demo (depends on the model and prompt). If the LLM never tries, the RLS-block story can't be shown — but the *defense* is still in place and provable via direct SQL.
+- **Masking is mask-by-default, not deny-by-default.** A column without a row in `platform.column_policies` returns its raw value to anyone with RLS access. If you add a new PII column to a table, you must also add a `column_policies` row, or the masking layer silently lets it through. Production would add a check constraint or trigger that raises when columns are added without policies, but for the demo this is operator discipline.
+- **The `apply_mask()` function is `VOLATILE` because it writes audit rows.** This blocks query folding and prevents some planner optimizations on the masked view. For the demo's small data this is invisible; production at scale would batch the audit inserts or move the audit-log writes to a `SECURITY DEFINER` wrapper function.
 
 ### How to use this section
 
@@ -727,6 +848,12 @@ A: The signature verifies the token *was* issued and hasn't expired, but it can'
 **Q: Can the LLM forge a request to bypass RLS?**
 A: No. The LLM doesn't have database credentials, network access, or any way to issue raw SQL. Every LLM tool call goes through the web app, which calls `run_with_identity(sub, act.sub, scope)` before executing the query. RLS sees the agent's identity regardless of what the LLM asks for. Even if the LLM emits a perfectly crafted SQL string, it can't bypass the GUCs the application sets.
 
+**Q: Can a compromised agent see raw PII?**
+A: No — masked or not, agents see transformed cell values for every column with a policy. Three independent checks keep the agent from seeing raw values: (1) the control plane's `strip_full_suffix()` removes `.full` from the agent's effective scope claim, (2) `compute_umask(..., is_agent=True)` always returns `'masked'`, and (3) the DB's `apply_mask()` reads `app.unmask_level` and only returns raw when it's literally `'raw'`. See §6.5.
+
+**Q: Why a security-barrier *and* a security-invoker view?**
+A: `security_barrier=true` prevents the planner from pushing WHERE clauses past the `apply_mask()` call (good for defense-in-depth). `security_invoker=true` is the *critical* one: without it, a view owned by a superuser (`postgres` in this demo) would be expanded with the view owner's privileges during planning, bypassing the FORCE ROW LEVEL SECURITY marker on the underlying table. PG 15+ added this option specifically to make view-based RLS reliable.
+
 **Q: How do I rotate the signing key?**
 A: (1) Generate a new RSA keypair (`scripts/gen_keys.py` updated to output a new key). (2) Add the new public key to JWKS with a new `kid`. (3) Restart the control plane to start signing new tokens with the new private key. (4) Leave the old key in JWKS for the cache TTL (~hours) so existing tokens still verify. (5) Remove the old key. JWKS supports multiple keys at once, so rotation is graceful. Production should automate this with a KMS.
 
@@ -767,7 +894,7 @@ A: OIDC custom claims are how most apps encode roles (`groups: ["senior_analyst"
 ### Practical
 
 **Q: What's the smallest piece I could lift out for my own project?**
-A: The `app_session` role + RLS policies in `db/init.sql`. That's the "last line of defense" pattern in ~50 lines of SQL. Add JWT issuance later (any library works — this demo's control plane is ~700 lines if you want to study it). Most projects start with just RLS and an upstream auth check, then add OAuth when they need multi-app or delegated-agent support.
+A: The `app_session` role + RLS policies in `db/init.sql`. That's the "last line of defense" pattern in ~50 lines of SQL. Add JWT issuance later (any library works — this demo's control plane is ~700 lines if you want to study it). Most projects start with just RLS and an upstream auth check, then add OAuth when they need multi-app or delegated-agent support. For PII concerns, also lift the `apply_mask()` function and `target.transactions_masked` view pattern — the masked view + security_invoker approach has saved real projects from shipping RLRedisabled views.
 
 **Q: What are the most common pitfalls when implementing this pattern?**
 A:
@@ -826,12 +953,15 @@ A: `make test` runs the verification suite (30+ scenarios). For new tests, the p
 | **Token verification** | Web-app fetches JWKS, verifies signature + `iss` + `aud` + `exp` on every request |
 | **Short-lived tokens** | 1h access, 8h refresh (humans only) |
 | **Scope downscoping** | During token exchange, effective scope = `subject.scopes ∩ agent.default_scopes` |
+| **Principal-type floor** | Non-human tokens get `umask='masked'` regardless of `.full` scopes (`roles.compute_umask`, `strip_full_suffix`) |
 | **Role-based authorization** | `platform.roles` + `platform.role_scopes` define what each role can do |
 | **Three-tier RLS** | Human / delegated / headless — each has a distinct access pattern |
+| **Cell-level masking** | `apply_mask()` reads `app.unmask_level`; `target.transactions_masked` returns transformed PII when level != raw |
+| **RLS through views** | `security_invoker=true` makes superuser-owned views inherit RLS for the invoking user |
 | **CSRF protection** | `itsdangerous` tokens on all state-changing forms; OAuth flow protected by `state` + PKCE |
 | **Client auth** | `client_secret_basic` (Authorization header) on `/oauth/token` |
 | **Revocation** | `POST /oauth/revoke` (RFC 7009); tokens tracked in `platform.token_records.revoked` |
-| **Audit completeness** | Token events, RLS blocks, and LLM turns all logged |
+| **Audit completeness** | Token events, RLS blocks, raw PII accesses (`unmask_access`), and LLM turns all logged |
 
 ## 12. Glossary
 
@@ -845,10 +975,17 @@ Terms used throughout this document, with the precise meaning intended here.
 | **Downscoping** | Reducing a token's permissions to the intersection of the subject's allowed scopes and the actor's allowed scopes. A read-only copilot cannot be granted a write scope even if the human user has it. |
 | **Scope** | A named permission, e.g., `read:transactions`, `write:transactions`. Issued by the control plane and bound to a JWT at issuance. Enforced by both the web app (token scope check) and the database (RLS). |
 | **Role** | A named bundle of scopes assigned to a human user (e.g., `senior_analyst` → R+W; `junior_analyst` → R). Roles live in `platform.roles` and `platform.role_scopes`. Roles only apply to human users — agents get scopes directly from `platform.agents.default_scopes`. |
+| **umask** | An internal JWT claim (`umask`) set by the control plane at issuance. Value is `'raw'` if the bearer has raw-PII clearance, otherwise `'masked'`. Read by the web app and pushed down to Postgres as the `app.unmask_level` GUC; the DB's `apply_mask()` reads it to decide cell-level masking. Defaults to `'masked'`. |
+| **Principal-type floor** | The control-plane rule that any token minted for a non-human principal (delegated agent with `act` set, or client-credentials / headless agent) is always forced to `umask='masked'` regardless of which `.full` scopes it would otherwise carry. Implemented in `control-plane/app/services/roles.py` (`compute_umask`, `strip_full_suffix`). |
+| **Masking policy** | A row in `platform.column_policies` describing how a sensitive column should be transformed when the bearer lacks raw clearance. Defines `mask_type` (`full`/`partial`/`hash`/`null`) and optional `mask_params` (e.g., `{"visible_tail": 4}`). Edited via `cli-admin column-policy ...`. |
+| **Masked view** | A Postgres `security_barrier` view (`target.transactions_masked`) that selects through `apply_mask()` for every PII column. Tools query this view, not the base table, so cells get masked automatically while RLS still controls rows. |
+| **apply_mask()** | PL/pgSQL function (in `db/init.sql`) that takes `(table_name, column_name, raw_value, row_pk)` and returns either the raw value or the policy-mandated transformation, based on `app.unmask_level`. Writes an `unmask_access` row to the audit log when a PII column returns raw. |
+| **Security invoker** | A PG15+ view option (`security_invoker=true`) that makes the view run with the *invoking user's* privileges rather than the *view owner's*. Without this, a view owned by a superuser (e.g., `postgres` in the demo's `init.sql`) would have its base-table RLS bypassed. The masked view uses it for this reason. |
+| **unmask_access** | Audit event type written by `apply_mask()` whenever a PII column is returned raw. Dedup is per `(table, row)` per transaction via a transaction-local GUC flag, so three PII columns on one row produce one row, not three. |
 | **RS256** | RSA-SHA256 signing algorithm for JWTs. Asymmetric: the control plane signs with a private key, the web app verifies with the public key published at `/.well-known/jwks.json`. |
 | **JWKS** | JSON Web Key Set — a JSON document listing the public keys an issuer uses to sign JWTs. Standardized location: `/.well-known/jwks.json`. The web app caches this and uses it to verify every incoming token. |
 | **PKCE** | Proof Key for Code Exchange (RFC 7636). A cryptographic binding between an authorization request and its token exchange. Prevents authorization code interception. This demo enforces S256 only. |
-| **GUC** | Grand Unified Configuration — a Postgres session variable (e.g., `app.user_id`). This demo uses `SET LOCAL` to populate `app.user_id` and `app.actor_id` at the start of each transaction; RLS policies read them via `current_setting()`. |
+| **GUC** | Grand Unified Configuration — a Postgres session variable (e.g., `app.user_id`). This demo uses `SET LOCAL` to populate `app.user_id`, `app.actor_id`, and `app.unmask_level` at the start of each transaction; RLS policies read `user_id`/`actor_id` and `apply_mask()` reads `unmask_level`. |
 | **RLS** | Row-Level Security — Postgres feature where policies on a table filter which rows are visible to (or modifiable by) which connections. The database connection role (`app_session`) is non-superuser, so RLS is always enforced. |
 | **JTI** | JWT ID — a unique identifier per issued token. Tracked in `platform.token_records` so the control plane can revoke specific tokens (RFC 7009). |
 | **Refresh token rotation** | OAuth 2.1 pattern: every refresh of an access token issues a new refresh token and revokes the old one. Limits the blast radius of a stolen refresh token. |
@@ -948,7 +1085,7 @@ The demo's value isn't the custom control plane — it's the **end-to-end identi
 ├── README.md                    # Lean: pitch + quickstart + arch pointer
 ├── .env.example                 # All env vars (no defaults for LLM creds)
 ├── db/
-│   └── init.sql                 # Schemas, tables, RLS, role layer, seed
+│   └── init.sql                 # Schemas, tables, RLS, masking engine, masked view, seed
 ├── control-plane/               # FastAPI OAuth 2.1 + RFC 8693 server
 │   ├── Dockerfile
 │   ├── requirements.txt
@@ -957,19 +1094,19 @@ The demo's value isn't the custom control plane — it's the **end-to-end identi
 │       ├── main.py              # FastAPI app
 │       ├── config.py            # env-driven config
 │       ├── db.py                # psycopg pool
-│       ├── jwt_utils.py         # mint/verify JWT, PKCE
+│       ├── jwt_utils.py         # mint/verify JWT (with umask claim), PKCE
 │       ├── keys.py              # JWKS export
 │       ├── routes/
 │       │   ├── jwks.py          # /.well-known/jwks.json
 │       │   ├── authorize.py     # /authorize (login form)
-│       │   ├── token.py         # /oauth/token (4 grant types)
+│       │   ├── token.py         # /oauth/token (4 grant types; sets umask + applies floor)
 │       │   ├── userinfo.py      # /oauth/userinfo (OIDC)
 │       │   └── introspect.py    # /oauth/introspect, /oauth/revoke
 │       ├── services/
 │       │   ├── users.py         # BCrypt password verify
 │       │   ├── clients.py       # BCrypt client_secret verify
 │       │   ├── agents.py        # Agent registration lookup
-│       │   ├── roles.py         # Role → scope resolution
+│       │   ├── roles.py         # Role/scope + umask computation + principal-type floor
 │       │   ├── codes.py         # In-memory auth codes + refresh tokens
 │       │   └── audit.py         # platform.audit_log + token_records writes
 │       └── templates/login.html
@@ -979,16 +1116,16 @@ The demo's value isn't the custom control plane — it's the **end-to-end identi
 │   └── app/
 │       ├── main.py
 │       ├── config.py
-│       ├── db.py                # Per-request conn + run_with_identity()
-│       ├── tools.py             # list_my / list_shared / update / delete
+│       ├── db.py                # Per-request conn + run_with_identity() + umask GUC
+│       ├── tools.py             # Read tools query target.transactions_masked
 │       ├── llm.py               # OpenAI tool-calling loop
 │       ├── jwt_verify.py        # JWKS cache + verify
 │       ├── oauth_client.py      # PKCE, code exchange, token exchange, client creds
 │       ├── session.py           # itsdangerous session + CSRF
 │       └── routes/
 │           ├── ui.py            # /login, /callback, /dashboard
-│           ├── actions.py       # /action/*, /chat/*, /api/*, /revoke/*
-│           └── admin.py         # /admin (read-only dashboard for roles/agents/clients/tokens)
+│           ├── actions.py       # /action/*, /chat/*, /api/*, /revoke/* (umask plumbing, masking demos)
+│           └── admin.py         # /admin (read-only: roles/agents/clients/column_policies)
 ├── cli-agent/                   # Headless OAuth 2.1 client
 │   ├── README.md
 │   ├── requirements.txt
@@ -999,11 +1136,18 @@ The demo's value isn't the custom control plane — it's the **end-to-end identi
 ├── cli-admin/                   # CLI for managing platform.* tables
 │   ├── README.md
 │   ├── requirements.txt
-│   └── admin.py                 # role/agent/client/token subcommands; writes to audit_log
+│   └── admin.py                 # role/agent/client/token/column-policy subcommands; writes to audit_log
 ├── scripts/
 │   ├── gen_keys.py              # RS256 keypair
 │   └── seed_passwords.py        # BCrypt hash helper
 └── docs/
     ├── ARCHITECTURE.md          # This file
     └── RUNBOOK.md               # Setup + demo walkthrough
+
+└── tests/                       # pytest suite (run via `make test`)
+    ├── conftest.py              # Shared fixtures (stack-up wait, DB connection helper)
+    ├── test_oauth.py            # OAuth 2.1 grant-type behavior
+    ├── test_rls.py              # RLS branches: human/delegated/headless + audit
+    └── test_masking.py          # Column-level masking: 4 principal paths + edge cases
+```
 ```

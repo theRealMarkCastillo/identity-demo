@@ -35,6 +35,7 @@ These ten properties are present in the demo **as built**. They show up in any s
 | 8 | **Non-superuser DB role** | Connection pools can't bypass RLS; blast radius of app compromise is bounded. | `app_session` grant in `init.sql` |
 | 9 | **Split-the-world token strategy** | Browser sessions are stateful; API tokens are stateless JWT; resource-server verifications don't need a callback. | `web-app/app/session.py` vs `jwt_verify.py` |
 | 10 | **Per-event audit trail** | Every token lifecycle event and every RLS block is recorded. Distinguishes "user did X" from "user's agent did X." | `platform.audit_log` + `platform.token_records` |
+| 11 | **Column-level masking with a principal-type floor** | PII cells return masked values to agents *unconditionally*, with raw clearance only for entitled humans. The mask decision lives in the DB, not the app. | `db/init.sql:apply_mask()` + `target.transactions_masked` + `roles.compute_umask` |
 
 These are the properties you're adopting. They're not free — operating an AS, an audit log, and an RLS-aware schema all cost work — but they're the value-prop of the pattern.
 

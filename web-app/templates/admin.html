@@ -97,6 +97,27 @@
     </div>
 
     <div class="card">
+      <h2>Column Masking Policies ({{ column_policies|length }})</h2>
+      {% if column_policies %}
+      <table>
+        <thead><tr><th>Table</th><th>Column</th><th>Mask</th><th>Params</th><th>Min scope (raw)</th><th>Description</th></tr></thead>
+        <tbody>
+          {% for p in column_policies %}
+          <tr>
+            <td><code>{{ p.table_name }}</code></td>
+            <td><code>{{ p.column_name }}</code></td>
+            <td><span class="badge" style="background:#7f1d1d; color:#fca5a5;">{{ p.mask_type }}</span></td>
+            <td><code style="font-size:10px;">{{ p.mask_params or '—' }}</code></td>
+            <td><code>{{ p.min_scope }}</code></td>
+            <td style="font-size:11px; color:#94a3b8;">{{ p.description or '' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<p class="muted">No column policies registered.</p>{% endif %}
+    </div>
+
+    <div class="card">
       <h2>Delegation Activity (24h)</h2>
       <div style="margin-bottom: 10px;">
         <div class="stat"><div class="k">Active tokens</div><div class="v">{{ active_count }}</div></div>

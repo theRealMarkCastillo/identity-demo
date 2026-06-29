@@ -2,11 +2,18 @@
 -- Identity & Agent Authorization Demo - Database Initialization
 -- ============================================================================
 -- Two schemas:
---   platform: control plane metadata, audit, tokens
---   target:   business data, protected by RLS
+--   platform: control plane metadata, audit, tokens, masking policies
+--   target:   business data, protected by RLS (rows) and masking (cells)
 --
--- Three roles for users: senior_analyst (R+W), junior_analyst (R), auditor (R shared)
--- Three principal types enforced at RLS: human direct, delegated agent, headless agent
+-- Three roles for users:
+--   senior_analyst (R+W, sees raw PII via .full scopes)
+--   junior_analyst (R,  PII always masked)
+--   auditor        (R,  PII always masked; sees shared rows too)
+--
+-- Three principal types enforced at RLS:
+--   human direct      - own rows + writes
+--   delegated agent   - acting on behalf of a user, scoped to user rows
+--   headless agent    - principal is the agent itself, shared rows only
 -- ============================================================================
 
 \set app_db_password `echo "$APP_DB_PASSWORD"`
@@ -44,13 +51,21 @@ CREATE TABLE platform.role_scopes (
 );
 
 INSERT INTO platform.roles VALUES
-  ('senior_analyst', 'Full read/write access to own transactions'),
-  ('junior_analyst', 'Read-only access to own transactions'),
-  ('auditor',        'Read access to own + shared transactions, no writes');
+  ('senior_analyst', 'Full read/write access to own transactions (sees raw PII)'),
+  ('junior_analyst', 'Read-only access to own transactions (PII masked)'),
+  ('auditor',        'Read access to own + shared transactions, no writes (PII masked)');
 
+-- senior_analyst also holds .full variants: their effective scope includes the
+-- .full suffix, which the control plane's `compute_umask()` reads as "raw
+-- clearance". The principal-type floor (enforced at the control plane --
+-- `roles.compute_umask` and `roles.strip_full_suffix`) makes agents always
+-- masked even if their effective scopes included .full, so junior_analyst and
+-- auditor stay masked.
 INSERT INTO platform.role_scopes VALUES
   ('senior_analyst', 'read:transactions'),
   ('senior_analyst', 'write:transactions'),
+  ('senior_analyst', 'read:transactions.full'),
+  ('senior_analyst', 'write:transactions.full'),
   ('junior_analyst', 'read:transactions'),
   ('auditor',        'read:transactions');
 
@@ -107,7 +122,7 @@ CREATE TABLE platform.agents (
 );
 
 INSERT INTO platform.agents VALUES
-  ('agent_copilot_99',  'Analyst copilot (UI-delegatable)', ARRAY['read:transactions'], TRUE),
+  ('agent_copilot_99',  'Analyst copilot (UI-delegatable)', ARRAY['read:transactions','read:transactions.full'], TRUE),
   ('agent_etl_nightly', 'Nightly ETL monitor (headless)',   ARRAY['read:transactions'], FALSE);
 
 GRANT SELECT ON platform.agents TO app_session;
@@ -130,6 +145,39 @@ CREATE INDEX idx_token_records_sub ON platform.token_records(sub);
 CREATE INDEX idx_token_records_act_sub ON platform.token_records(act_sub) WHERE act_sub IS NOT NULL;
 
 GRANT SELECT, INSERT, UPDATE ON platform.token_records TO app_session;
+
+-- ----------------------------------------------------------------------------
+-- platform: column_policies (column-level data masking policies)
+--
+-- One row per (table, column). Describes how a sensitive column should be
+-- transformed when the current principal does NOT have raw clearance (GUC
+-- app.unmask_level != 'raw'). The decision of raw vs masked is made by the
+-- web app (read from the token's umask claim) and pushed down to the DB as
+-- app.unmask_level via SET LOCAL. See apply_mask() and target.transactions_masked.
+-- ----------------------------------------------------------------------------
+CREATE TABLE platform.column_policies (
+  table_name     TEXT NOT NULL,
+  column_name    TEXT NOT NULL,
+  mask_type      TEXT NOT NULL CHECK (mask_type IN ('full','partial','hash','null')),
+  mask_params    JSONB,                          -- e.g. {"visible_tail": 4} for partial
+  min_scope      TEXT NOT NULL,                  -- scope required to bypass the mask
+  description    TEXT,
+  PRIMARY KEY (table_name, column_name)
+);
+
+-- Seed policies for the demo's PII columns on target.transactions.
+INSERT INTO platform.column_policies VALUES
+  ('target.transactions', 'ssn',
+     'full', NULL, 'read:transactions.full',
+     'US SSN - full redaction when unmask_level != raw'),
+  ('target.transactions', 'card_pan',
+     'partial', '{"visible_tail": 4}', 'read:transactions.full',
+     'Payment card PAN - show last 4 only unless raw clearance'),
+  ('target.transactions', 'email',
+     'hash', NULL, 'read:transactions.full',
+     'Email - SHA256 hash (deterministic per row, not reversible)');
+
+GRANT SELECT ON platform.column_policies TO app_session;
 
 -- ----------------------------------------------------------------------------
 -- platform: audit_log (security events)
@@ -182,16 +230,22 @@ CREATE TABLE target.transactions (
   amount        NUMERIC(12,2) NOT NULL,
   ts            TIMESTAMPTZ NOT NULL DEFAULT now(),
   owner_user_id TEXT NOT NULL,
-  is_shared     BOOLEAN NOT NULL DEFAULT FALSE
+  is_shared     BOOLEAN NOT NULL DEFAULT FALSE,
+  -- PII columns (masking policies live in platform.column_policies).
+  -- Seeded with realistic-looking but synthetic values for the demo. DO NOT use
+  -- real SSNs/PANs/emails in any environment.
+  ssn           TEXT,
+  card_pan      TEXT,
+  email         TEXT
 );
 
-INSERT INTO target.transactions (account_id, amount, owner_user_id, is_shared) VALUES
-  ('ACC-001', 1500.00, 'user_123', FALSE),
-  ('ACC-001', -200.00, 'user_123', FALSE),
-  ('ACC-002', 4200.00, 'user_123', FALSE),
-  ('ACC-101', 999.99,  'user_456', FALSE),
-  ('SHARED', 10000.00, 'user_456', TRUE),
-  ('SHARED', 500.50,   'user_123', TRUE);
+INSERT INTO target.transactions (account_id, amount, owner_user_id, is_shared, ssn, card_pan, email) VALUES
+  ('ACC-001',  1500.00, 'user_123', FALSE, '123-45-6789', '4111111111111111', 'alice@example.com'),
+  ('ACC-001',  -200.00, 'user_123', FALSE, '123-45-6789', '4111111111111111', 'alice@example.com'),
+  ('ACC-002',  4200.00, 'user_123', FALSE, '123-45-6789', '5500000000000004', 'alice@example.com'),
+  ('ACC-101',   999.99, 'user_456', FALSE, '987-65-4321', '340000000000009',  'bob@example.com'),
+  ('SHARED',  10000.00, 'user_456', TRUE,  '987-65-4321', '6011000000000004', 'bob@example.com'),
+  ('SHARED',    500.50, 'user_123', TRUE,  '123-45-6789', '3530111333300000', 'alice@example.com');
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON target.transactions TO app_session;
 
@@ -260,10 +314,158 @@ CREATE TRIGGER trg_audit_blocked_write
   AFTER INSERT OR UPDATE OR DELETE ON target.transactions
   FOR EACH STATEMENT EXECUTE FUNCTION target.audit_blocked_write();
 
+-- ============================================================================
+-- Column-level masking engine
+-- ============================================================================
+-- Push-down pattern:
+--   - Control plane decides raw vs masked based on scope (.full suffix) and
+--     principal type (human vs agent). Stores the result in the JWT as the
+--     `umask` claim.
+--   - Web app reads `umask` and `SET LOCAL app.unmask_level = 'raw'|'masked'`.
+--   - apply_mask() reads app.unmask_level and returns raw or transformed value.
+--     NULLs are passed through as NULL (never masked to the empty-string hash).
+--   - When a PII column is returned raw, an `unmask_access` row is written to
+--     platform.audit_log (deduped per (table, row) via a transaction-local GUC
+--     flag) -- this is the compliance hook for "who saw raw PII, when, where".
+--   - Read tools query `target.transactions_masked` (security_barrier +
+--     security_invoker view) so the same RLS policies still control row-level
+--     filtering before masking runs.
+-- ============================================================================
+
+-- pgcrypto provides digest() for the hash mask_type.
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+
+-- ----------------------------------------------------------------------------
+-- apply_mask: per-cell masking decision
+-- Signature: (table, column, raw_value, row_pk)
+-- Returns the value as the current principal should see it.
+-- Audit behavior: when the value is a PII column returned raw, inserts one
+--   row into platform.audit_log per (table, row) per query (dedup via the
+--   transaction-local GUC app._umask_aud_<table>_<row_pk>).
+-- Volatility: must be VOLATILE because it performs an INSERT into audit_log
+--   when returning raw. STABLE would cause Postgres to reject the DML.
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION apply_mask(
+  p_table_name  TEXT,
+  p_column_name TEXT,
+  p_raw_value   TEXT,
+  p_row_pk      TEXT DEFAULT ''
+) RETURNS TEXT
+LANGUAGE plpgsql VOLATILE AS $$
+DECLARE
+  v_policy          platform.column_policies%ROWTYPE;
+  v_has_policy      BOOLEAN := FALSE;
+  v_unmask_level    TEXT;
+  v_result          TEXT;
+  v_audit_flag_name TEXT;
+BEGIN
+  -- NULL is a no-information value: pass through unchanged regardless of mask.
+  -- Keeps NULLs from accidentally leaking a hash of empty string.
+  IF p_raw_value IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  -- Look up the policy. VOLATILE because of the audit-log INSERT below.
+  SELECT * INTO v_policy
+    FROM platform.column_policies
+   WHERE table_name  = p_table_name
+     AND column_name = p_column_name;
+  v_has_policy := FOUND;
+
+  -- Read the principal's effective clearance (set via SET LOCAL by the web app
+  -- from the JWT's umask claim). Defaults to 'masked' if unset.
+  v_unmask_level := COALESCE(NULLIF(current_setting('app.unmask_level', true), ''), 'masked');
+
+  -- The single decision point: raw -> return value; masked -> transform.
+  IF v_unmask_level = 'raw' THEN
+    v_result := p_raw_value;
+  ELSIF NOT v_has_policy THEN
+    -- No policy registered for this column -> unmasked (defensive default).
+    v_result := p_raw_value;
+  ELSE
+    CASE v_policy.mask_type
+      WHEN 'full'    THEN v_result := '***';
+      WHEN 'null'    THEN v_result := NULL;
+      WHEN 'partial' THEN
+        -- visible_tail defaults to 4 if params missing/garbage.
+        v_result := right(
+          p_raw_value,
+          GREATEST(
+            COALESCE((v_policy.mask_params ->> 'visible_tail')::INT, 4),
+            0
+          )
+        );
+      WHEN 'hash'    THEN
+        v_result := 'sha256:' || encode(digest(p_raw_value, 'sha256'), 'hex');
+      ELSE
+        v_result := p_raw_value;
+    END CASE;
+  END IF;
+
+  -- Audit: when a PII column was returned raw, log once per (table, row) per txn.
+  -- NULLs were already early-returned, so this branch only fires on real values.
+  IF v_has_policy AND v_unmask_level = 'raw' THEN
+    v_audit_flag_name := 'app._umask_aud_' || p_table_name || '_' || COALESCE(p_row_pk, 'norow');
+    IF current_setting(v_audit_flag_name, true) IS DISTINCT FROM '1' THEN
+      PERFORM set_config(v_audit_flag_name, '1', true);
+      INSERT INTO platform.audit_log (event_type, sub, act_sub, target_table, result, details)
+      VALUES (
+        'unmask_access',
+        current_user_id(),
+        current_actor_id(),
+        p_table_name,
+        'raw',
+        jsonb_build_object('column', p_column_name, 'row_pk', p_row_pk)
+      );
+    END IF;
+  END IF;
+
+  RETURN v_result;
+END;
+$$;
+
+
+-- ----------------------------------------------------------------------------
+-- target.transactions_masked: security_barrier view over the base table.
+-- All PII columns go through apply_mask so RLS still controls rows (which rows
+-- the principal can SEE) and masking controls cells (which cells come back raw).
+--
+-- Why `security_invoker = true` (and not just security_barrier):
+-- Views are normally expanded with the *view owner's* permissions during query
+-- planning, which means a view owned by a superuser (the common init.sql case)
+-- would bypass RLS on the underlying table -- the FORCE row-security marker
+-- doesn't cover this code path. `security_invoker = true` (PG15+) makes the
+-- expanded view run with the *invoking user's* privileges, so RLS is enforced
+-- for app_session exactly as it would be on a direct base-table query.
+-- ----------------------------------------------------------------------------
+CREATE VIEW target.transactions_masked
+WITH (security_barrier=true, security_invoker=true) AS
+SELECT
+  id,
+  account_id,
+  amount,
+  ts,
+  owner_user_id,
+  is_shared,
+  apply_mask('target.transactions', 'ssn',      ssn,      id::TEXT) AS ssn,
+  apply_mask('target.transactions', 'card_pan', card_pan, id::TEXT) AS card_pan,
+  apply_mask('target.transactions', 'email',    email,    id::TEXT) AS email
+FROM target.transactions;
+
+-- Writes still go to the base table directly (no masked-view writes).
+-- Reads must use transactions_masked to get cell-level masking.
+GRANT SELECT ON target.transactions_masked TO app_session;
+COMMENT ON VIEW target.transactions_masked IS
+  'Security-barrier view: RLS-filtered rows with per-cell masking via apply_mask(). '
+  'Tools should read this view, not target.transactions directly, so PII columns '
+  'are masked for principals without raw clearance.';
+
 -- ----------------------------------------------------------------------------
 -- Privileges summary
 -- ----------------------------------------------------------------------------
 -- control_plane_admin: full access to all platform + target (for issuance, lookup)
 -- app_session: SELECT/INSERT/UPDATE on platform.token_records, audit_log, llm_log;
---              SELECT on platform.users/clients/agents/roles/role_scopes;
---              full CRUD on target.transactions (RLS still enforced via FORCE)
+--              SELECT on platform.users/clients/agents/roles/role_scopes/column_policies;
+--              full CRUD on target.transactions (RLS still enforced via FORCE);
+--              SELECT on target.transactions_masked (RLS inherited via security_barrier view)

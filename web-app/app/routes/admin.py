@@ -65,6 +65,22 @@ def admin_dashboard(request: Request):
             for r in cur.fetchall()
         ]
 
+        # Column-level masking policies
+        cur.execute("""
+            SELECT table_name, column_name, mask_type, mask_params, min_scope, description
+            FROM platform.column_policies
+            ORDER BY table_name, column_name
+        """)
+        column_policies = [
+            {
+                "table_name": r[0], "column_name": r[1], "mask_type": r[2],
+                "mask_params": r[3], "min_scope": r[4], "description": r[5],
+            }
+            for r in cur.fetchall()
+        ]
+
+
+
         # Active token count + most recent 10
         cur.execute("SELECT COUNT(*) FROM platform.token_records WHERE revoked=FALSE")
         active_count = cur.fetchone()[0]
@@ -115,6 +131,7 @@ def admin_dashboard(request: Request):
             "roles": roles,
             "agents": agents,
             "clients": clients,
+            "column_policies": column_policies,
             "active_count": active_count,
             "tokens": tokens,
             "usage_24h": usage_24h,

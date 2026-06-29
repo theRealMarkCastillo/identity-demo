@@ -1,5 +1,11 @@
-"""DB tool implementations. No auth logic - caller sets GUCs."""
-import json
+"""DB tool implementations. No auth logic - caller sets GUCs.
+
+Read tools target `target.transactions_masked` (the security_barrier +
+security_invoker view), which evaluates `apply_mask()` per cell based on the
+transaction-local GUC `app.unmask_level`. Writes still target the base table
+directly because they don't return row data to the caller (and so masking is
+moot for them).
+"""
 from datetime import datetime
 from decimal import Decimal
 
@@ -20,8 +26,9 @@ def _row_to_dict(row, cols):
 def list_my_transactions(conn) -> list[dict]:
     with conn.cursor() as cur:
         cur.execute(
-            """SELECT id, account_id, amount, owner_user_id, is_shared, ts
-               FROM target.transactions
+            """SELECT id, account_id, amount, owner_user_id, is_shared, ts,
+                      ssn, card_pan, email
+               FROM target.transactions_masked
                ORDER BY id"""
         )
         cols = [d.name for d in cur.description]
@@ -29,7 +36,7 @@ def list_my_transactions(conn) -> list[dict]:
 
 
 def list_shared_transactions(conn) -> list[dict]:
-    """Same as list_my_transactions; relies on RLS to filter to is_shared rows."""
+    """Same source as list_my_transactions; relies on RLS to filter to is_shared rows."""
     return list_my_transactions(conn)
 
 

@@ -104,16 +104,40 @@ If the smoke test passes, you're ready for the demo.
 
 > "Most AI agent demos use a single service account to talk to the database. That means an agent can do anything, and you can't tell who did what. What we're showing is identity flowing from the user, through the OAuth token, all the way down to Postgres row-level security. Three principals, three OAuth flows, one RLS engine. Let's start."
 
+### Demo map: which user for what
+
+Use this as a quick reference during the walkthrough. All three users share password **`pw123`**.
+
+| Demo | Who logs in | Why this user | What this user demonstrates that the others don't |
+|---|---|---|---|
+| **Demo 1** (human direct) | `user_123` (senior_analyst) | Has `.full` scopes; raw umask | PII comes back raw; can write own rows |
+| **Demo 1b** (role-based authz) | **Logout → login as `user_456`** (junior_analyst) | No `.full`; no write scope | PII comes back masked even on row RLS; Update Row blocked |
+| **Demo 1c** (redaction one-click) | **Logout → back to `user_123`** | The masking diff + comparison are senior-only | Side-by-side `raw → masked` table; copilot view of same row |
+| **Demo 2 / 2b / 2b-extra / 2c** (delegation) | `user_123` | Has full scopes → most interesting delegation tradeoff | Subject token has `.full`, agent token doesn't — floor visible |
+| **Demo 3** (headless) | none — agent has its own identity | Demonstrates M2M | Watch the **Background Agent** panel; no human session involved |
+| (Alternative) auditor view | `user_789` (auditor) | Same masked coverage as junior, but ALSO sees shared rows from other owners | Use during Q&A if asked "what does the third user look like?" |
+
+**Pre-flight check (do this before the presentation):**
+
+```bash
+# Smoke that all three users can log in and that the masking engine is responding.
+psql -h localhost -p 54321 -U app_session -d identity -c \
+  "SELECT id, owner_user_id, ssn FROM target.transactions_masked;"
+# (set app.user_id, app.actor_id, app.unmask_level first if you want to test specific paths)
+```
+
+If the web-app container was rebuilt recently, the dashboard should already show **8 demo buttons** under "One-Click Demos": Human: Read Own, Human: Update Row, Copilot: Read Own, Copilot: Full Clearance Attempt, Copilot: Try Update, Masking: Side-by-Side Diff, plus Headless.
+
 ### Demo 1: Human Direct (1 min)
 
 1. Open `http://localhost:13000` in a browser
 2. Click **Sign in with Control Plane** → login as `user_123` / `pw123`
 3. Land on the dashboard. Point at the **Human JWT** panel:
    > "This is a real RS256 JWT. `sub: user_123`, scope is `read + write` from the role, no `act` claim — this is direct human access."
-4. Point at the **Current Principal** panel:
-   > "Role: senior_analyst, scopes: read, write. This is what the policy engine resolved for this user."
-5. Click **Human: Update Row** → green success.
-   > "Direct human access. The RLS `modify_human_only` policy matched: owner_user_id matches and no actor is present."
+4. Point at the **Current Principal** panel — it has two blocks once a delegation is active:
+   > "Top block: *You (human)* — sub, role, scopes, your umask. Bottom block (appearing after a Copilot action): *Active delegation* — actor id, granted scope, agent umask. So as long as `agent_copilot_99` is delegated, both umask badges are visible at once: green for you, red for the agent. Your own clearance didn't change when you delegated — the principal-type floor forced the agent's `umask` to masked."
+5. Click **Human: Update Row** → green success. The PII columns (`ssn`, `card_pan`, `email`) come back **raw** because the principal has raw clearance.
+   > "Direct human access. The RLS `modify_human_only` policy matched: owner_user_id matches and no actor is present. And because the role has `.full` scopes, the cell-level mask layer returns raw PII."
 
 > **If asked "is the JWT really signed?"** → Open a new tab and visit `http://localhost:18080/jwks.json`. Copy the `n` and `e` values into [jwt.io](https://jwt.io) along with the JWT from the UI. The "Signature Verified" check will pass — this is RSA verification in the browser, not a trust assumption.
 
@@ -122,13 +146,33 @@ If the smoke test passes, you're ready for the demo.
 ### Demo 1b: Role-Based Authz (1 min)
 
 1. Click **Logout** → login as `user_456` / `pw123` (junior_analyst)
-2. Current Principal panel: `Role: junior_analyst`, `Scopes: read only`
-3. Click **Human: Update Row** → BLOCKED.
-   > "Same button, different user. The role mapping stripped the `write:transactions` scope at the token layer. The token doesn't have write, so the policy check fails."
+2. Current Principal panel: `Role: junior_analyst`, `Scopes: read only`, `umask: masked` (red badge, not green).
+3. Click **Human: Read Own (PII as I see it)** → returns junior's two rows, but with `ssn='***'`, `card_pan='0009'` (last-4), `email='sha256:…'`.
+   > "Same button, different user. The role mapping stripped the `.full` scopes — the token does have `read:transactions` but no `read:transactions.full` — so the control plane computed `umask: masked`. Same SQL, same DB, two different answers."
+4. Click **Human: Update Row** → BLOCKED.
+   > "And on writes, junior doesn't have `write:transactions` at all. Two layers stack: token scope AND row RLS would both reject this."
+5. Look at the **Audit Feed**: `unmask_access` rows from the senior_analyst session above should still be visible. Junior sees no such row — no raw PII was disclosed.
+   > "Notice the `umask` badge is red, not green. The cell masking layer is doing its job even though junior has row-level read access."
+6. **Optional**: Click **Masking: Side-by-Side Diff** here as well. The endpoint correctly returns `result: skipped` with a message explaining that junior isn't entitled to raw clearance. This proves the role-gate — it's not a cosmetic security.
+   > "The comparison endpoint is senior-only on purpose. We won't force `app.unmask_level='raw'` on behalf of someone who isn't entitled to raw."
 
-> **If asked "could the web app just ignore the scope?"** → "Yes, the web app *could* — but it doesn't get to. The web app receives the token, extracts the scope, and passes it to the tool layer. The tool calls `run_with_identity(sub, scope)` which uses the **token's** scope, not anything the web app invents. And RLS enforces it independently — the web app can't bypass the database."
+> **If asked "could the web app just ignore the scope?"** → "Yes, the web app *could* — but it doesn't get to. The web app receives the token, extracts the scope, and passes it to the tool layer. The tool calls `run_with_identity(sub, scope, umask)` which uses the **token's** scope and **token's** umask, not anything the web app invents. And RLS enforces it independently — the web app can't bypass the database."
 
-> **If asked "where is the role → scope mapping?"** → Run: `psql ... -c "SELECT r.role, rs.scope FROM platform.roles r JOIN platform.role_scopes rs ON rs.role=r.role ORDER BY r.role, rs.scope;"` (or use the Useful Queries section). Show that `junior_analyst` has only `read:transactions` while `senior_analyst` has both.
+### Demo 1c: Redaction, One-Click (30s)
+
+After Demo 1b, you've been viewing as `user_456` (junior). **Switch back to `user_123`** to see what the same data looks like under raw clearance.
+
+1. Click **Logout** → login as `user_123` / `pw123` (senior_analyst).
+2. Click **Human: Read Own (PII as I see it)** → same rows as junior saw moments ago, but now with `ssn='123-45-6789'`, `card_pan='4111111111111111'`, `email='alice@example.com'`.
+   > "Same query, same DB, different answer: senior's token has `umask: raw` because the role grants `.full` scopes. Junior's did not."
+3. Click **Masking: Side-by-Side Diff** → renders a table where each row shows `raw → masked` per PII column. Same query, two answers, side by side.
+   > "Each cell has two values: what the row looks like to a senior, and what `apply_mask()` returned when forced to masked. The card_pan policy is `partial` with `visible_tail=4`, so full `4111111111111111` becomes `1111`. The email policy is `hash`, so `alice@example.com` becomes `sha256:ff8d98…` — deterministic per row, not reversible."
+4. Click **Copilot: Read Own** → the same rows again, but now via the agent token — every PII cell is masked. Three clicks, three views of the same row.
+   > "Same rows, three different answers: me-direct (raw), me-via-comparison (raw+masked table), me-via-agent (always masked). The masking engine + the principal-type floor produce all three from a single SQL function."
+
+> **If asked "why is the side-by-side gated to senior_analyst?"** → "Because otherwise we'd force `app.unmask_level='raw'` on behalf of a user who isn't entitled to raw — and the entire point of the umask GUC is that it's driven by a verified JWT, not arbitrary HTTP requests. Junior_analyst and auditor get a 'skipped' message instead. The DB never sees an unauthorized raw read."
+
+> **If asked "where is the role → scope mapping?"** → Run: `psql ... -c "SELECT r.role, rs.scope FROM platform.roles r JOIN platform.role_scopes rs ON rs.role=r.role ORDER BY r.role, rs.scope;"` (or use the Useful Queries section). Show that `junior_analyst` has only `read:transactions` while `senior_analyst` has both `.full` and base variants.
 
 ### Demo 2: Delegated Agent — The Killer Demo (2 min)
 
@@ -137,12 +181,23 @@ If the smoke test passes, you're ready for the demo.
    > "Now the user has delegated to a Copilot. The web-app did an RFC 8693 token exchange. Look at the **Agent JWT** panel: same `sub: user_123`, but now there's an `act` claim with `agent_copilot_99`. And the scope is just `read:transactions` — the agent's default scopes intersected with the user's scopes."
 3. Click **Copilot: Try Update** → BLOCKED.
    > "Same data, same user, but the agent is acting. The RLS sees the `actor_id` and refuses the write. The audit log records the attempt."
+4. **Critical detail (new)**: scroll the output JSON. Note the `ssn`, `card_pan`, `email` fields — they come back as `***`, last-4 PAN, and `sha256:…` despite the **human** principal having raw clearance. The agent token's `umask: masked` was set by the principal-type floor.
+   > "Even though the human user has raw umask clearance, the copilot's token carries `umask: masked`. That decision was made at the control plane: agents can never have `.full` scopes, regardless of what the user's subject token says."
 
-> **If asked "could the agent just use the user's original token?"** → "In principle, yes — but the web app never gives the agent the user's token. The token exchange is the only path: the web app sends the user's token + agent's actor identity to the control plane, gets back a *new* token with `act` set and scope downscoped. The agent never holds the unscoped token. See ARCHITECTURE.md §7.2 for the sequence."
+### Demo 2b-extra: Full Clearance Attempt (30s)
 
-> **If asked "what's the downscope formula?"** → Open `control-plane/app/routes/token.py:_grant_token_exchange` (live in editor or `docker compose exec control-plane grep`). Show the line `effective = sorted(subject_scopes & agent_scopes)`. "One line of set intersection. That's the entire delegation-safety story."
+This demo reinforces the principal-type floor with visible "evidence":
 
-> **If asked "what if the agent's default scopes were wider than the user's?"** → "It can't escalate — the intersection is one-way. A copilot registered with `read:transactions, admin:all` would still get only `read:transactions` when delegated by `junior_analyst`. The intersection caps the agent at the user's permissions."
+1. Still logged in as `user_123` with the agent token active
+2. Click **Copilot: Full Clearance Attempt**
+3. The response shows:
+   - `human_umask: raw` (the subject token's clearance)
+   - `agent_umask: masked` (the exchanged agent token's clearance)
+   - `note`: explanation of the floor
+4. The PII columns in the response are **still masked** — same `***`, last-4, hash.
+   > "You tried to grant full clearance to the agent. The control plane honored your explicit scope request, then stripped `.full` out of the agent's effective scope claim, and forced umask to masked. Three independent layers, all saying no. An agent that wants to see raw PII has to escalate at a layer none of these can hide from: the audit log."
+
+> **If asked "what is the principal-type floor?"** → "It's the rule that any token minted for a non-human principal (`act` claim present, or `client_credentials`) gets `umask: masked` regardless of which scopes are in its effective set. Implemented in `control-plane/app/services/roles.py:compute_umask` and reinforced by `apply_mask` reading `app.unmask_level` at the database. See ARCHITECTURE.md §6.5."
 
 ### Demo 2b: LLM Tool-Calling — The Real Show (2 min)
 
@@ -192,38 +247,40 @@ If the smoke test passes, you're ready for the demo.
 
 ### If time is short (5-minute cut)
 
-Skip Demo 1b, Demo 2b, and Demo 2c. The minimum viable story:
+Skip Demo 1b, Demo 1c (redaction one-click), **Demo 2b (LLM tool-calling)**, Demo 2b-extra (full clearance), and Demo 2c (revoke). The minimum viable story:
 
-1. **Demo 1** (human direct) — establish the baseline
-2. **Demo 2** (delegated agent, just the button click) — show the `act` claim appearing
+1. **Demo 1** (human direct as `user_123`) — establish the baseline; click **Human: Read Own** to surface raw PII
+2. **Demo 2** (delegated agent, button click) — show the `act` claim appearing
 3. **Demo 3** (headless) — show the third principal type
 
-Everything else can be covered in Q&A.
+Everything else can be covered in Q&A. If the masking story specifically comes up in Q&A, hop to Demo 1c — it's 30 seconds and answers the question concretely.
 
 ## 6. Where to Dig Deeper After the Demo
 
-**Verification first:** run `make test` after `make up` — the suite covers 30+ scenarios across all three principal types and is the fastest way to confirm your install is wired up correctly. See `tests/`.
+**Verification first:** run `make test` after `make up` — the suite covers 35+ scenarios across all three principal types (RLS + masking) and is the fastest way to confirm your install is wired up correctly. See `tests/`.
 
 If you want to understand how each piece is built, the files below are the entry points. Read in this order if you're new to the codebase:
 
 | What you want to understand | File to open | Why it matters |
 |---|---|---|
-| How the database enforces identity | `db/init.sql` | The RLS policies, role mapping, seed data, and `app_session` role all live here. This is the **last line of defense**. |
-| How the control plane issues tokens | `control-plane/app/routes/token.py` | All 4 grant types (`authorization_code`, `refresh_token`, token-exchange, `client_credentials`) in one file. ~250 lines, well-commented. |
+| How the database enforces identity | `db/init.sql` | RLS policies, role mapping, seed data, `app_session` role, **and the column-level masking engine** (`apply_mask()` + `target.transactions_masked`) all live here. This is the **last line of defense**. |
+| How the control plane issues tokens | `control-plane/app/routes/token.py` | All 4 grant types (`authorization_code`, `refresh_token`, token-exchange, `client_credentials`) in one file. ~250 lines, well-commented. Each grants the `umask` claim and enforces the principal-type floor on agent paths. |
 | How the control plane enforces OAuth 2.1 | `control-plane/app/routes/authorize.py` | Rejects anything other than PKCE/S256 — this is what makes the demo OAuth 2.1-compliant, not just OAuth 2.0-flavored. |
-| How token exchange actually works | `control-plane/app/routes/token.py` (`_grant_token_exchange`) | See the `effective = subject.scopes ∩ agent.default_scopes` computation, the `act` claim being set, and the audit log entry being written. |
+| How token exchange actually works | `control-plane/app/routes/token.py` (`_grant_token_exchange`) | See the `effective = sorted(subject_scopes & agent_scopes)` computation, the `act` claim being set, and the principal-type floor (`strip_full_suffix` + `compute_umask`). |
+| How umask is computed and enforced | `control-plane/app/services/roles.py` | `compute_umask(scopes, is_agent)` and `strip_full_suffix(scopes)` — the principal-type floor in ~20 lines. |
 | How the web app verifies a token | `web-app/app/jwt_verify.py` | JWKS cache, signature verification, `iss` / `aud` / `exp` checks. |
-| How the web app propagates identity to the DB | `web-app/app/db.py` | The `run_with_identity()` helper — see how `SET LOCAL app.user_id, app.actor_id` is called per-transaction. |
-| How an LLM tool call ends up in RLS | `web-app/app/tools.py` | Each tool is a function that opens a connection, sets the GUCs, and runs a query. The DB enforces the rest. |
-| How the headless agent authenticates | `cli-agent/agent.py` | Calls `/oauth/token` with HTTP Basic auth + `grant_type=client_credentials`. No human in the loop. |
-| The read-only admin dashboard | `web-app/app/routes/admin.py` + `web-app/templates/admin.html` | Browse roles/agents/clients/active tokens without write access. |
-| How to manage policies from the CLI | `cli-admin/admin.py` | Thin Python wrapper over `platform.*` tables. Every write logs to `platform.audit_log`. See `cli-admin/README.md`. |
+| How the web app propagates identity to the DB | `web-app/app/db.py` | The `run_with_identity()` helper — see how `SET LOCAL app.user_id, app.actor_id, app.unmask_level` is called per-transaction. |
+| How an LLM tool call ends up in RLS + masking | `web-app/app/tools.py` | Read tools query `target.transactions_masked`; write tools hit the base table directly. The DB enforces the rest. |
+| How the headless agent authenticates | `cli-agent/agent.py` | Calls `/oauth/token` with HTTP Basic auth + `grant_type=client_credentials`. Receives a token with `umask: masked` per the principal-type floor. |
+| The read-only admin dashboard | `web-app/app/routes/admin.py` + `web-app/templates/admin.html` | Browse roles/agents/clients/column_policies/active tokens without write access. |
+| How to manage policies from the CLI | `cli-admin/admin.py` | Thin Python wrapper over `platform.*` tables. Every write logs to `platform.audit_log`. `column-policy` commands manage masking policies. See `cli-admin/README.md`. |
 | The complete delegation flow (diagram) | `docs/ARCHITECTURE.md` §3 (RFC 8693 section) | The "Why these standards" section explains the design rationale end-to-end. |
+| How masking extends defense-in-depth from rows to cells | `docs/ARCHITECTURE.md` §6.5 | Sequence diagram + the principal-type floor + the security-invoker + security-barrier view trick. |
 
 **The most rewarding 5-minute deep dive:**
 
-1. Open `db/init.sql` — find `CREATE POLICY select_policy ON target.transactions`. Read the three branches (human / delegated / headless). Notice how each branch inspects `current_actor_id()` and `current_user_id()`.
-2. Open `control-plane/app/routes/token.py` — find `_grant_token_exchange`. See the line `effective = sorted(subject_scopes & agent_scopes)`. That's the entire delegation-safety story in one expression.
+1. Open `db/init.sql` — find `CREATE POLICY select_policy ON target.transactions`. Read the three branches (human / delegated / headless). Notice how each branch inspects `current_actor_id()` and `current_user_id()`. Then scroll to `apply_mask()` and the `target.transactions_masked` view — cell-level masking layered on top.
+2. Open `control-plane/app/routes/token.py` — find `_grant_token_exchange`. See the line `effective = sorted(subject_scopes & agent_scopes)`. Just below, the principal-type floor (`strip_full_suffix` + `compute_umask`) hardens the scope claim and the `umask` claim.
 3. Trigger an RLS block (Demo 2 step 3). Then run:
    ```sql
    SELECT ts, event_type, sub, act_sub, details
@@ -232,6 +289,14 @@ If you want to understand how each piece is built, the files below are the entry
    ORDER BY ts DESC LIMIT 5;
    ```
    The `act_sub` column shows which agent tried to do what — this is the audit trail that distinguishes "user did it" from "user's agent did it."
+4. (Masking) Trigger a raw read (any `list_my_transactions` as `user_123`):
+   ```sql
+   SELECT ts, sub, act_sub, target_table, details
+   FROM platform.audit_log
+   WHERE event_type = 'unmask_access'
+   ORDER BY ts DESC LIMIT 5;
+   ```
+   Each row is one (table, row) per query — proves who saw raw PII, when, and on which row.
 
 ## 7. Managing Policies, Agents, and Tokens
 
@@ -244,11 +309,12 @@ Browse to **`http://localhost:13000/admin`** after logging in. The dashboard sho
 - **Roles** — table of `platform.roles` × `platform.role_scopes` (role, scopes, description)
 - **Agents** — registered agents with `default_scopes` and `is_delegatable` flag
 - **OAuth clients** — `client_id`, `client_type`, whether a secret is set, allowed scopes
+- **Column masking policies** — `platform.column_policies` rows (table, column, mask, params, min scope, description)
 - **Delegation activity (24h)** — which agents are being delegated to, and how often
 - **Recent active tokens** — top 10 by `created_at`, with principal/actor/scope/exp
 - **Admin history** — recent `admin_*` rows from `platform.audit_log` (every cli-admin write)
 
-This page is **strictly read-only**. It uses the web app's existing `app_session` DB role, which only has `SELECT` on `platform.roles/role_scopes/agents/clients`. No CSRF tokens are issued because nothing is written.
+This page is **strictly read-only**. It uses the web app's existing `app_session` DB role, which only has `SELECT` on `platform.roles/role_scopes/agents/clients/column_policies`. No CSRF tokens are issued because nothing is written.
 
 ### CLI admin tool
 
@@ -283,6 +349,13 @@ make admin ARGS="token list --sub user_123"
 make admin ARGS="token revoke <jti>"
 make admin ARGS="token revoke-all --sub user_456"
 make admin ARGS="token revoke-all --client-id web-app"
+
+# Column masking policies (data lives in platform.column_policies)
+make admin ARGS="column-policy list"
+make admin ARGS="column-policy add target.transactions ssn --mask-type full --min-scope read:transactions.full --description 'US SSN - always redacted'"
+make admin ARGS="column-policy add target.transactions card_pan --mask-type partial --params '{\"visible_tail\": 4}' --min-scope read:transactions.full"
+make admin ARGS="column-policy update target.transactions card_pan --params '{\"visible_tail\": 6}'"
+make admin ARGS="column-policy delete target.transactions email"
 ```
 
 Required env: `CONTROL_PLANE_DB_PASSWORD` (matches `.env`). Optional: `DB_HOST`, `DB_PORT`, `DB_NAME`, `ADMIN_DB_USER` (defaults shown in `admin.py`).
@@ -329,6 +402,8 @@ make logs      # Tail logs from all services
 | `invalid_grant` on token exchange | Code expired (10min) or already used | Re-login from scratch |
 | `invalid_grant` on PKCE | Code verifier tampered | Don't modify the session cookie manually |
 | RLS doesn't block the agent's write | GUCs not set / wrong role | Check `docker compose logs web-app` for SET LOCAL; check current principal panel |
+| Masked view returns raw values when it shouldn't | `app.unmask_level` GUC not set / set to `'raw'` | Confirm the token's `umask` claim (`jwt.io` or `decode_unverified`); confirm `run_with_identity` is sending `umask`; check `apply_mask` doesn't short-circuit (look for missing `pgcrypto` extension) |
+| `apply_mask` raises `INSERT is not allowed in a non-volatile function` | `apply_mask` was redefined as `STABLE` instead of `VOLATILE` | The function must be `VOLATILE` to allow the audit-log INSERT. `make reset` rebuilds the function with the correct volatility. |
 
 ## 10. Talking-Point Cheat Sheet (one-pager)
 
@@ -352,11 +427,19 @@ For audience questions:
 
 - **"Could the LLM just leak the user's JWT in its output?"** In principle, yes. That's why the demo's JWTs are short-lived (1h) and why revocation works mid-conversation (Demo 2c). In production you'd add output filtering, scope the token to a specific audience, and consider DPoP (RFC 9449) so a stolen token can't be replayed from a different machine.
 
+- **"What stops the agent from seeing raw PII?"** Three independent checks: (1) the control plane's `strip_full_suffix()` removes `.full` from the agent's effective scope claim, so the claim honestly says what the bearer can do; (2) `compute_umask(..., is_agent=True)` always returns `'masked'`; (3) the database's `apply_mask()` only returns raw when `app.unmask_level='raw'`, and that GUC is only ever set when the JWT says so. Bypass one, two more wait.
+- **"Can I see what 'masked' looks like for a senior?"** Yes — log in as `user_123` (senior_analyst) and click **Masking: Side-by-Side Diff**. It runs the same query twice and renders a `raw → masked` table. Click **Copilot: Read Own** to see the always-masked view an agent would have of the same data. Three buttons, three angles on the same data.
+
+- **"Is `data_class: 'pii'` a JWT claim I'd add?"** No — a custom JWT claim gets messy across issuers. We chose scope suffix + internal `umask` claim instead, because scopes already have semantics (limits what an agent can do), they're standard OAuth, and the control plane is the single authority that interprets them. If you want it more declarative, you'd issue a `data_class` claim from your IDP and have the control plane translate it to `umask` — a layer cake. For most production systems, scopes are enough.
+
 ## 11. Useful URLs
 
 | Service | URL |
 |---|---|
 | Web App (dashboard) | http://localhost:13000 |
+| Web App — current principal | http://localhost:13000/api/principal (returns sub/role/scopes/umask) |
+| Web App — admin (read-only) | http://localhost:13000/admin (after login) |
+| Web App — masking demo endpoints (curl/Postman; need CSRF + session cookie) | `POST /action/human-read`, `POST /action/masking-comparison`, `POST /action/copilot-{read,full,write}`, `POST /trigger-headless`, `POST /revoke/agent-token`, `POST /revoke/session` |
 | Control Plane health | http://localhost:18080/health |
 | Control Plane JWKS | http://localhost:18080/jwks.json |
 | Control Plane OAuth token | http://localhost:18080/oauth/token |
@@ -414,6 +497,18 @@ ORDER BY r.role, rs.scope;
 SELECT agent_id, default_scopes, is_delegatable
 FROM platform.agents
 ORDER BY agent_id;
+
+-- Column masking policies: who gets raw vs masked for each PII column
+SELECT table_name, column_name, mask_type, mask_params, min_scope, description
+FROM platform.column_policies
+ORDER BY table_name, column_name;
+
+-- Unmask audit: every time a PII column was returned raw
+-- (deduped per (table, row) per query, not per cell)
+SELECT ts, sub, act_sub, target_table, result, details
+FROM platform.audit_log
+WHERE event_type = 'unmask_access'
+ORDER BY ts DESC;
 
 -- LLM turns (both web-app copilot and headless cli-agent)
 SELECT ts, principal, role, tool_name, tool_ok

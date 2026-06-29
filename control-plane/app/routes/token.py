@@ -1,13 +1,13 @@
 """POST /oauth/token - all 4 grant types."""
 import base64
 import binascii
+import time
 from datetime import datetime, timezone
-from fastapi import APIRouter, Form, HTTPException, Request, status
+from fastapi import APIRouter, Form, HTTPException, Request
 
 from ..config import config
 from ..jwt_utils import (
     mint_jwt,
-    mint_refresh_token,
     verify_jwt,
     verify_pkce,
 )
@@ -99,20 +99,23 @@ async def _grant_authorization_code(client, code, code_verifier, redirect_uri):
         raise HTTPException(status_code=400, detail={"error": "invalid_scope"})
 
     scope_str = " ".join(effective)
+    # Humans are allowed to keep .full scopes and receive raw umask clearance.
+    umask = roles.compute_umask(effective, is_agent=False)
     access_token, jti = mint_jwt(
         sub=ac.user_id,
         scope=scope_str,
         client_id=client["client_id"],
         exp_seconds=config.JWT_TTL_SECONDS,
+        umask=umask,
     )
-    exp_dt = datetime.fromtimestamp(int(__import__("time").time()) + config.JWT_TTL_SECONDS, tz=timezone.utc)
+    exp_dt = datetime.fromtimestamp(int(time.time()) + config.JWT_TTL_SECONDS, tz=timezone.utc)
     audit.record_token(jti, ac.user_id, None, client["client_id"], scope_str, exp_dt)
     audit.log_audit(
         event_type="token_issue",
         sub=ac.user_id,
         client_id=client["client_id"],
         result="success",
-        details={"grant_type": "authorization_code", "role": user_role, "scope": scope_str},
+        details={"grant_type": "authorization_code", "role": user_role, "scope": scope_str, "umask": umask},
     )
     refresh = create_refresh(ac.user_id, client["client_id"], effective, jti, config.REFRESH_TTL_SECONDS)
     return {
@@ -121,6 +124,7 @@ async def _grant_authorization_code(client, code, code_verifier, redirect_uri):
         "expires_in": config.JWT_TTL_SECONDS,
         "refresh_token": refresh,
         "scope": scope_str,
+        "umask": umask,
     }
 
 
@@ -138,21 +142,22 @@ async def _grant_refresh_token(client, refresh_token):
         raise HTTPException(status_code=400, detail={"error": "invalid_grant", "error_description": "user has no role"})
     effective = roles.compute_effective_scopes(user_role, rt.scope)
     scope_str = " ".join(effective)
+    umask = roles.compute_umask(effective, is_agent=False)
     access_token, jti = mint_jwt(
         sub=rt.user_id,
         scope=scope_str,
         client_id=client["client_id"],
         exp_seconds=config.JWT_TTL_SECONDS,
+        umask=umask,
     )
-    import time as _t
-    exp_dt = datetime.fromtimestamp(int(_t.time()) + config.JWT_TTL_SECONDS, tz=timezone.utc)
+    exp_dt = datetime.fromtimestamp(int(time.time()) + config.JWT_TTL_SECONDS, tz=timezone.utc)
     audit.record_token(jti, rt.user_id, None, client["client_id"], scope_str, exp_dt)
     audit.log_audit(
         event_type="token_refresh",
         sub=rt.user_id,
         client_id=client["client_id"],
         result="success",
-        details={"scope": scope_str, "role": user_role},
+        details={"scope": scope_str, "role": user_role, "umask": umask},
     )
     new_refresh = create_refresh(rt.user_id, client["client_id"], effective, jti, config.REFRESH_TTL_SECONDS)
     return {
@@ -161,6 +166,7 @@ async def _grant_refresh_token(client, refresh_token):
         "expires_in": config.JWT_TTL_SECONDS,
         "refresh_token": new_refresh,
         "scope": scope_str,
+        "umask": umask,
     }
 
 
@@ -190,10 +196,17 @@ async def _grant_token_exchange(client, subject_token, subject_token_type, audie
     # Compute effective = subject_scopes ∩ agent.default_scopes
     subject_scopes = set(subject_claims.get("scope", "").split())
     agent_scopes = set(agent["default_scopes"])
-    effective = sorted(subject_scopes & agent_scopes)
-    if not effective:
+    raw_effective = sorted(subject_scopes & agent_scopes)
+    if not raw_effective:
         raise HTTPException(status_code=400, detail={"error": "invalid_scope"})
+    # Principal-type floor: agents never receive `.full` clearance. Strip the
+    # suffix from any scope in the effective set before exposing it in the
+    # `scope` claim (keeps the claim honest about what the agent can do).
+    effective = roles.strip_full_suffix(raw_effective)
     scope_str = " ".join(effective)
+    # Even though the agent's `scope` claim no longer has `.full`, compute_umask
+    # ALSO enforces `is_agent -> masked`. Belt-and-suspenders.
+    umask = roles.compute_umask(raw_effective, is_agent=True)
 
     access_token, jti = mint_jwt(
         sub=subject_claims["sub"],
@@ -201,9 +214,9 @@ async def _grant_token_exchange(client, subject_token, subject_token_type, audie
         client_id=client["client_id"],
         exp_seconds=config.JWT_TTL_SECONDS,
         act={"sub": agent_id},
+        umask=umask,
     )
-    import time as _t
-    exp_dt = datetime.fromtimestamp(int(_t.time()) + config.JWT_TTL_SECONDS, tz=timezone.utc)
+    exp_dt = datetime.fromtimestamp(int(time.time()) + config.JWT_TTL_SECONDS, tz=timezone.utc)
     audit.record_token(jti, subject_claims["sub"], agent_id, client["client_id"], scope_str, exp_dt)
     audit.log_audit(
         event_type="token_exchange",
@@ -212,7 +225,13 @@ async def _grant_token_exchange(client, subject_token, subject_token_type, audie
         client_id=client["client_id"],
         agent_id=agent_id,
         result="success",
-        details={"scope": scope_str, "subject_scope": " ".join(sorted(subject_scopes))},
+        details={
+            "scope": scope_str,
+            "raw_intersection_scope": " ".join(raw_effective),
+            "subject_scope": " ".join(sorted(subject_scopes)),
+            "umask": umask,
+            "floor_applied": raw_effective != effective,
+        },
     )
     return {
         "access_token": access_token,
@@ -220,6 +239,7 @@ async def _grant_token_exchange(client, subject_token, subject_token_type, audie
         "token_type": "Bearer",
         "expires_in": config.JWT_TTL_SECONDS,
         "scope": scope_str,
+        "umask": umask,
     }
 
 
@@ -234,19 +254,22 @@ async def _grant_client_credentials(client, scope):
 
     requested = [s for s in (scope or "").split() if s]
     allowed = set(client["allowed_scopes"])
-    effective = [s for s in requested if s in allowed] if requested else list(allowed)
-    if not effective:
+    raw_effective = [s for s in requested if s in allowed] if requested else list(allowed)
+    if not raw_effective:
         raise HTTPException(status_code=400, detail={"error": "invalid_scope"})
+    # Principal-type floor: headless agents never receive `.full` clearance.
+    effective = roles.strip_full_suffix(raw_effective)
     scope_str = " ".join(effective)
+    umask = roles.compute_umask(raw_effective, is_agent=True)
 
     access_token, jti = mint_jwt(
         sub=agent_id,
         scope=scope_str,
         client_id=client["client_id"],
         exp_seconds=config.JWT_TTL_SECONDS,
+        umask=umask,
     )
-    import time as _t
-    exp_dt = datetime.fromtimestamp(int(_t.time()) + config.JWT_TTL_SECONDS, tz=timezone.utc)
+    exp_dt = datetime.fromtimestamp(int(time.time()) + config.JWT_TTL_SECONDS, tz=timezone.utc)
     audit.record_token(jti, agent_id, None, client["client_id"], scope_str, exp_dt)
     audit.log_audit(
         event_type="token_issue_principal=agent",
@@ -254,7 +277,13 @@ async def _grant_client_credentials(client, scope):
         client_id=client["client_id"],
         agent_id=agent_id,
         result="success",
-        details={"grant_type": "client_credentials", "scope": scope_str},
+        details={
+            "grant_type": "client_credentials",
+            "scope": scope_str,
+            "raw_intersection_scope": " ".join(raw_effective),
+            "umask": umask,
+            "floor_applied": raw_effective != effective,
+        },
     )
     return {
         "access_token": access_token,
@@ -262,4 +291,5 @@ async def _grant_client_credentials(client, scope):
         "token_type": "Bearer",
         "expires_in": config.JWT_TTL_SECONDS,
         "scope": scope_str,
+        "umask": umask,
     }

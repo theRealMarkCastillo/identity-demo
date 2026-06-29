@@ -30,8 +30,15 @@ def mint_jwt(
     client_id: str,
     exp_seconds: int,
     act: dict[str, Any] | None = None,
+    umask: str = "masked",
 ) -> tuple[str, str]:
-    """Mint an RS256 JWT. Returns (token, jti)."""
+    """Mint an RS256 JWT. Returns (token, jti).
+
+    `umask` is an internal claim (not part of OAuth spec) that tells the
+    database whether the holder should see raw PII ('raw') or masked values
+    ('masked'). Defaults to 'masked'. The principal-type floor (roles.py)
+    is responsible for downgrading this for agents.
+    """
     jti = str(uuid.uuid4())
     now = int(time.time())
     claims = {
@@ -43,6 +50,7 @@ def mint_jwt(
         "jti": jti,
         "iat": now,
         "exp": now + exp_seconds,
+        "umask": umask,
     }
     if act is not None:
         claims["act"] = act

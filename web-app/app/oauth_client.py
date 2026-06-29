@@ -18,12 +18,16 @@ def pkce_challenge_s256(verifier: str) -> str:
 
 
 def build_authorize_url(state: str, code_challenge: str) -> str:
-    # Use the PUBLIC URL (browser-reachable) for the redirect, not the internal Docker URL
+    # Use the PUBLIC URL (browser-reachable) for the redirect, not the internal Docker URL.
+    # We request the `.full` variants alongside the base scopes. If the user's role
+    # supports `.full` (senior_analyst), the effective scope will include it and the
+    # umask will be 'raw'. If not (junior_analyst, auditor), the role mapping drops
+    # `.full` at the token layer and umask stays 'masked'.
     params = {
         "response_type": "code",
         "client_id": config.CLIENT_ID,
         "redirect_uri": config.REDIRECT_URI,
-        "scope": "read:transactions write:transactions",
+        "scope": "read:transactions write:transactions read:transactions.full write:transactions.full",
         "state": state,
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
