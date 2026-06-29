@@ -12,6 +12,7 @@ If you're new to the demo, read in this order:
 6. **Threat Model (§8)**, **FAQ (§9)** — explicit enumeration of what this demo defends against, plus 25+ Q&As on concepts, tech, ops, comparisons, and pitfalls.
 7. **Audit & Observability (§10)**, **Security Properties (§11)** — the verification story.
 8. **Glossary (§12)**, **Non-Goals (§13)**, **External IDP Integration (§14)**, **File Map (§15)** — reference material.
+9. **[PRODUCTION_PATTERNS.md](PRODUCTION_PATTERNS.md)** — the companion doc on adopting this pattern in production and building products for AI agents. Read it when you stop asking "how does this work" and start asking "how do I deploy / build with it."
 
 The Glossary (§12) defines every term used throughout (principal, actor, GUC, downscoping, etc.). Skip ahead to it whenever a term is unfamiliar. §14 explains how to swap the custom control plane for Okta/Auth0/Keycloak/etc. in production, including an RFC 8693 support matrix.
 

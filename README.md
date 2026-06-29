@@ -14,6 +14,9 @@ See [docs/RUNBOOK.md](docs/RUNBOOK.md).
 ## How it works
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## Production patterns & building for AI agents
+Adopting this pattern for a real system, or building a product on top of it? See [docs/PRODUCTION_PATTERNS.md](docs/PRODUCTION_PATTERNS.md) for seven production deployment archetypes (multi-tenant SaaS, regulated industry, zero-trust, federated, high-throughput, on-premise, edge) and six product categories for AI agents (MCP servers, agent platforms, observability, BYO-agent APIs, multi-agent orchestration, permission brokers).
+
 ## Verification
 30 scenarios covering all three principal types (human direct, delegated agent, headless agent). Run `make test` after `make up`.
 
