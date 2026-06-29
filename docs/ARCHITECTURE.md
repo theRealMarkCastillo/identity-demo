@@ -183,6 +183,69 @@ If an attacker compromises the web app, they can issue queries as `app_session` 
 
 This is why the web app never holds DB admin credentials. Production note: in a real deployment you'd also want network-level isolation (separate DB users per service, network policies, mTLS) — see §13 for the full list of production concerns.
 
+### Why Postgres specifically?
+
+Every other choice in this demo — JWT for distributed verification, `SET LOCAL` for identity propagation, RLS as the last line of defense — *requires* Postgres. Or a database with equivalent features, of which there are very few:
+
+| Database | Row-level security | Session GUCs (`SET LOCAL`) | Verdict |
+|---|---|---|---|
+| **Postgres** (this demo) | ✅ First-class (`CREATE POLICY ... USING`) | ✅ First-class | Picked |
+| Oracle | ✅ Fine-grained access control | ✅ Session-level `ALTER SESSION` | Would work; commercial |
+| SQL Server | ✅ Security policies | ✅ `SET CONTEXT_INFO` | Would work; commercial |
+| MySQL | ❌ No row-level security | ⚠️ Session vars exist but no policy integration | **Fails the core requirement** |
+| MongoDB | ❌ No row-level security | N/A | **Fails the core requirement** |
+| DynamoDB | ⚠️ IAM policies per-item (coarser) | N/A | Different model |
+| SQLite | ❌ No row-level security | N/A | **Fails the core requirement** |
+
+RLS is the demo's **last line of defense**. Without it, identity would have to be enforced at the application layer, which is exactly the trust assumption we're trying to eliminate. So Postgres (or one of the commercial equivalents) is mandatory. We picked Postgres specifically because:
+
+- **Open source** — no licensing to discuss for an educational demo.
+- **Mature RLS** — `CREATE POLICY` is well-documented, predictable, and has been stable since 9.5 (2016).
+- **`SET LOCAL` semantics** — transaction-scoped, automatically reset on commit/rollback, safe under connection pooling. Some other databases require explicit reset logic.
+- **Ecosystem** — every language has good Postgres drivers; `psycopg` is excellent.
+
+The dependency on Postgres is a real constraint. If you adapt this pattern to MySQL, you'd need to enforce row-level access in application code, which sacrifices the "database is the last line of defense" property.
+
+### Why split between browser sessions and API JWTs?
+
+The demo uses **two different auth mechanisms** depending on who the client is:
+
+| Direction | Mechanism | Why |
+|---|---|---|
+| **Browser → web app** | Signed session cookie (`itsdangerous` URLSafeTimedSerializer) | Stateful — server can revoke by deleting the session cookie. Browser UX needs "stay logged in" and "logout everywhere." |
+| **Web app → control plane** | None — same Python process | Internal function calls |
+| **Web app / cli-agent → DB** | JWT in `Authorization: Bearer` header (verified by `run_with_identity`) | Stateless — distributed verification. The DB itself checks the signature. |
+
+This is the **split-the-world pattern** (§3 "Why JWT at all?") in action within a single codebase. Browser sessions are stateful because the browser is a known, semi-trusted client that benefits from instant server-side revocation ("logout everywhere"). API tokens are stateless because the resource servers (the database, the control plane's `/oauth/userinfo`, etc.) can't all share a session store and shouldn't need to.
+
+A common mistake is to use JWTs for *both* (because "JWTs are modern") — but that gives browser sessions the wrong properties: they can't be revoked instantly, can't be logged out everywhere, and reveal claims to the client. The demo's split is deliberate.
+
+### Why in-band `jti` revocation
+
+JWTs are normally self-contained — the signature + `exp` is enough to verify. But this demo does an *extra* step on every API request:
+
+```sql
+SELECT jti FROM platform.token_records WHERE jti = %s AND revoked = FALSE
+```
+
+Why bother? Because **JWTs can't be revoked instantly.** A token with `exp` one hour from now will be accepted for the full hour, even if you know it was leaked. The `jti` lookup lets the control plane flip `revoked=TRUE` and the very next request returns 401.
+
+The trade-off:
+
+| Strategy | Revocation latency | Per-request cost |
+|---|---|---|
+| Short TTL only (no `jti` lookup) | Up to `exp` window (1h for us) | Zero — pure signature verification |
+| **`jti` revocation list** (this demo) | **Next request** (sub-second) | One indexed PK lookup per request (~0.5ms) |
+| Opaque tokens + introspection | Instant (kill in AS, next introspect fails) | Network round-trip to AS |
+
+We chose `jti` lookup because it gives instant revocation at the cost of one indexed lookup per request — cheap, and the indexed `jti` primary key makes it O(1). The cost is small because:
+
+- The lookup is a primary-key index hit — microseconds, not milliseconds.
+- The `revoked=TRUE` filter uses the same index, so even with millions of revoked tokens, the lookup stays fast.
+- The alternative (waiting up to 1h for token expiry) is unacceptable for the demo's revocation demo (Demo 2c in RUNBOOK.md).
+
+In production at higher scale, you'd back this with a cache (Redis with a short TTL on `jti → active`) or move to opaque + introspection for high-stakes endpoints where the lookup overhead is unacceptable.
+
 ## 4. System Components
 
 ```
@@ -644,6 +707,9 @@ A: Three reasons (see §3 "Postgres RLS via GUCs"): (1) query parameters can be 
 
 **Q: What's the latency overhead of JWT verification + DB roundtrip?**
 A: RS256 signature verification with a cached JWKS is ~0.1ms. A Postgres `SET LOCAL` + simple query is ~0.5ms. Total overhead is under 1ms per request — invisible in any real API. JWKS caching matters more than the verification itself; the web app caches the JWKS and refreshes on `kid` miss.
+
+**Q: Why does the web app do a DB lookup of `jti` on every request? Isn't the JWT signature enough?**
+A: The signature verifies the token *was* issued and hasn't expired, but it can't revoke it. The `jti` lookup against `platform.token_records` lets the control plane kill a token instantly (RFC 7009) — the very next request returns 401, not after the `exp` window. Trade-off: ~0.5ms per request for sub-second revocation. Covered in depth in §3 ("Why in-band `jti` revocation").
 
 **Q: Can the LLM forge a request to bypass RLS?**
 A: No. The LLM doesn't have database credentials, network access, or any way to issue raw SQL. Every LLM tool call goes through the web app, which calls `run_with_identity(sub, act.sub, scope)` before executing the query. RLS sees the agent's identity regardless of what the LLM asks for. Even if the LLM emits a perfectly crafted SQL string, it can't bypass the GUCs the application sets.
