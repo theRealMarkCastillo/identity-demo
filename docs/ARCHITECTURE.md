@@ -442,7 +442,7 @@ sequenceDiagram
     participant DB as Postgres
 
     C->>W: Request + Authorization Bearer <jwt>
-    W->>JWKS: GET jwks.json (cached; refresh on miss)
+    W->>JWKS: GET jwks.json (cached, refresh on miss)
     JWKS-->>W: keys array with kid, kty, n, e, alg
     W->>W: Verify RS256 signature with public key (kid match)
     W->>W: Verify iss == identity-control-plane
