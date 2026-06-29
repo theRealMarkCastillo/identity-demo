@@ -48,7 +48,7 @@ seed:
 
 demo:
 	@echo "Demo instructions:"
-	@echo "  1. Open http://localhost:30005 in your browser"
+	@echo "  1. Open http://localhost:13000 in your browser"
 	@echo "  2. Login as user_123 (senior_analyst, password: pw123)"
 	@echo "  3. Click 'Human: Update Row' — should succeed"
 	@echo "  4. Click 'Copilot: Try Update' — should be blocked by RLS"

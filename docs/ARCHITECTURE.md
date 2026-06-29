@@ -678,7 +678,7 @@ When evaluating the demo, walk down the "defended against" table and ask: *"is t
 
 ## 9. FAQ
 
-Common questions, organized by category. For live-demo Q&A prep see [RUNBOOK.md §9 Talking-Point Cheat Sheet](RUNBOOK.md#9-talking-point-cheat-sheet-one-pager).
+Common questions, organized by category. For live-demo Q&A prep see [RUNBOOK.md §10 Talking-Point Cheat Sheet](RUNBOOK.md#10-talking-point-cheat-sheet-one-pager).
 
 ### Conceptual
 

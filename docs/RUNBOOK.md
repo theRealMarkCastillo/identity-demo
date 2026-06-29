@@ -54,7 +54,9 @@ cd identity-demo
 # 2. Copy env and edit
 cp .env.example .env
 # Edit .env: set APP_DB_PASSWORD, CONTROL_PLANE_DB_PASSWORD, POSTGRES_PASSWORD,
-#            WEB_APP_CLIENT_SECRET, WEB_APP_SESSION_SECRET, FLASK_SECRET, LLM_*
+#            WEB_APP_CLIENT_SECRET, WEB_APP_SESSION_SECRET, FLASK_SECRET,
+#            WEB_APP_REDIRECT_URI (if not using default http://localhost:13000/callback),
+#            LLM_*
 
 # 3. Generate RS256 signing key for the Control Plane
 python3 scripts/gen_keys.py
@@ -68,7 +70,7 @@ docker compose ps
 # Expect: identity-db (healthy), control-plane (healthy), web-app (healthy)
 ```
 
-If `make up` fails, see [Troubleshooting](#7-troubleshooting).
+If `make up` fails, see [Troubleshooting](#9-troubleshooting).
 
 ## 4. Smoke Test (2 minutes)
 
@@ -178,6 +180,8 @@ If the smoke test passes, you're ready for the demo.
 4. Show the headless agent's JWT (it has `sub: agent_etl_nightly`, **no `act`** — that's the visual signature of headless operation).
    > "Same M2M pattern, but no human ever touched it. Could be a cron, a CI step, an Airflow DAG, anything."
 
+> **If the LLM is flaky** (returns nothing, errors, or refuses to call tools), re-run with `--deterministic` for a no-LLM-cost scripted turn that still exercises the full token-issuing + RLS path: `./cli-agent/agent.py run --deterministic`. Useful as a fallback when the LLM provider is down during the demo.
+
 > **If asked "why no refresh token for the headless agent?"** → "OAuth 2.1 explicitly disallows refresh tokens for the client credentials grant. Refresh tokens are for *interactive* flows where a human can revoke via UI; for a machine, you'd rather have it re-present its client secret every cycle. If the secret leaks, you rotate one secret — not chase down a fleet of long-lived tokens."
 
 > **If asked "what if the agent's secret leaks?"** → "Rotate the secret in `platform.clients`, redeploy the agent, and revoke all outstanding tokens for that client: `UPDATE platform.token_records SET revoked=TRUE WHERE client_id='agent_etl_nightly'`. Done. The agent re-authenticates with the new secret on its next tick."
@@ -197,6 +201,8 @@ Skip Demo 1b, Demo 2b, and Demo 2c. The minimum viable story:
 Everything else can be covered in Q&A.
 
 ## 6. Where to Dig Deeper After the Demo
+
+**Verification first:** run `make test` after `make up` — the suite covers 30+ scenarios across all three principal types and is the fastest way to confirm your install is wired up correctly. See `tests/`.
 
 If you want to understand how each piece is built, the files below are the entry points. Read in this order if you're new to the codebase:
 
@@ -227,7 +233,7 @@ If you want to understand how each piece is built, the files below are the entry
    ```
    The `act_sub` column shows which agent tried to do what — this is the audit trail that distinguishes "user did it" from "user's agent did it."
 
-## 6b. Managing Policies, Agents, and Tokens
+## 7. Managing Policies, Agents, and Tokens
 
 The demo ships with two complementary tools for operating on `platform.*` tables.
 
@@ -299,7 +305,7 @@ ORDER BY ts DESC LIMIT 20;
 
 For visual inspection, use the dashboard. For changes, use the CLI.
 
-## 7. Reset & Cleanup
+## 8. Reset & Cleanup
 
 ```bash
 make down      # Stop services, keep data
@@ -307,11 +313,11 @@ make reset     # Nuke volumes, restart fresh
 make logs      # Tail logs from all services
 ```
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Container exits with `LLM_BASE_URL is required` | Empty env var | Edit `.env`, set the var, `docker compose up -d` |
+| Chat returns `LLM_BASE_URL, LLM_API_KEY, and LLM_MODEL are required for chat` | One or more of the three `LLM_*` vars is empty in `.env` | Set `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` in `.env`, then `docker compose up -d` |
 | `permission denied for sequence audit_log_id_seq` | Missing grant in init.sql | `make reset` (rebuilds DB with fixed init.sql) |
 | `invalid hostPort` from docker compose | Port > 65535 | Use ports under 65536 (e.g., 18080, not 80805) |
 | Port already in use on host | Native Postgres / app running | `lsof -i :54321`, kill the process or change port in `.env` |
@@ -324,7 +330,7 @@ make logs      # Tail logs from all services
 | `invalid_grant` on PKCE | Code verifier tampered | Don't modify the session cookie manually |
 | RLS doesn't block the agent's write | GUCs not set / wrong role | Check `docker compose logs web-app` for SET LOCAL; check current principal panel |
 
-## 9. Talking-Point Cheat Sheet (one-pager)
+## 10. Talking-Point Cheat Sheet (one-pager)
 
 For audience questions:
 
@@ -346,7 +352,7 @@ For audience questions:
 
 - **"Could the LLM just leak the user's JWT in its output?"** In principle, yes. That's why the demo's JWTs are short-lived (1h) and why revocation works mid-conversation (Demo 2c). In production you'd add output filtering, scope the token to a specific audience, and consider DPoP (RFC 9449) so a stolen token can't be replayed from a different machine.
 
-## 10. Useful URLs
+## 11. Useful URLs
 
 | Service | URL |
 |---|---|
@@ -359,7 +365,7 @@ For audience questions:
 | Control Plane revoke | http://localhost:18080/oauth/revoke |
 | Postgres (psql) | `psql -h localhost -p 54321 -U app_session -d identity` (pw: `app_session_pw`) |
 
-## 11. Useful Queries
+## 12. Useful Queries
 
 ```sql
 -- THE most important query: see who did what, distinguishing principal from actor.
