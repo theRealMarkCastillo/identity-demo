@@ -1,7 +1,7 @@
 PYTHON ?= python3
 DC ?= docker compose
 
-.PHONY: help up down logs ps reset keys seed demo demo-headless admin admin-help test test-unit test-integration test-e2e
+.PHONY: help up down logs ps reset keys seed demo demo-headless admin admin-help check-mermaid test test-unit test-integration test-e2e
 
 help:
 	@echo "Identity Demo Makefile"
@@ -16,6 +16,7 @@ help:
 	@echo "  make demo-headless Run headless agent in a loop for live demo"
 	@echo "  make admin ARGS=...  Run a cli-admin command (e.g. 'make admin ARGS=role list')"
 	@echo "  make admin-help   Show cli-admin usage"
+	@echo "  make check-mermaid Verify all Mermaid diagrams in ARCHITECTURE.md parse"
 	@echo "  make test          Run all tests"
 	@echo "  make test-unit     Run unit tests only"
 
@@ -64,6 +65,10 @@ admin:
 
 admin-help:
 	@./cli-admin/admin.py --help
+
+check-mermaid:
+	@cd scripts && [ -d node_modules/mermaid ] || npm install mermaid@10 >/dev/null 2>&1
+	@node scripts/check-mermaid.mjs
 
 test:
 	$(DC) up -d identity-db
