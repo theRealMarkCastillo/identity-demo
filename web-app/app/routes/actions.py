@@ -138,11 +138,11 @@ def action_masking_comparison(request: Request, csrf_token: str = Form(...)):
     and returns a per-cell diff. This is the most concrete redaction demo:
     'same query, same row, different clearances, different output'.
 
-    Role-gated to `senior_analyst` because we'd otherwise force the GUC to
-    'raw' on behalf of a non-entitled principal. The whole point of the umask
-    GUC is to be driven by a verified JWT — we don't add an HTTP path that
-    lets a junior or agent escalate.
+    Gated by a Cedar policy (ViewMaskingComparison, permits senior_analyst)
+    evaluated by the control plane. We do the gate via HTTP so the web-app
+    doesn't need its own cedarpy dependency.
     """
+    import httpx  # local import keeps top-of-file imports stable
     verify_csrf(request, csrf_token)
     sess = _require_session(request)
     human_jwt = sess["tokens"]["access_token"]
@@ -157,14 +157,38 @@ def action_masking_comparison(request: Request, csrf_token: str = Form(...)):
             if row:
                 role = row[0]
 
-    if role != "senior_analyst":
+    # Cedar gate via the control-plane's internal endpoint.
+    try:
+        cp_resp = httpx.post(
+            f"{config.CONTROL_PLANE_URL}/admin/policies/internal/decide",
+            json={
+                "action": "ViewMaskingComparison",
+                "principal": {"type": "User", "id": sub, "attrs": {"role": role or ""}},
+                "resource": {"type": "User", "id": sub, "attrs": {}},
+            },
+            timeout=5.0,
+        )
+        cp_resp.raise_for_status()
+        decision = cp_resp.json()
+    except Exception as e:
+        log.exception("masking-comparison: control plane unreachable")
         return JSONResponse({
             "action": "masking_comparison",
             "result": "skipped",
             "sub": sub,
             "umask_claim": claims.get("umask"),
             "role": role,
-            "reason": "comparison requires senior_analyst (only roles with raw clearance). "
+            "reason": f"policy engine unavailable: {e}",
+        })
+
+    if not decision.get("allowed"):
+        return JSONResponse({
+            "action": "masking_comparison",
+            "result": "skipped",
+            "sub": sub,
+            "umask_claim": claims.get("umask"),
+            "role": role,
+            "reason": "comparison requires senior_analyst (ViewMaskingComparison policy denies). "
                       "Even when forced to 'raw' on your behalf, the row diff would still show 'masked' on both sides.",
         })
 
@@ -458,8 +482,8 @@ def headless_feed(limit: int = 10):
                    LIMIT %s""",
                 (limit,),
             )
-        cols = [d.name for d in cur.description]
-        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+            cols = [d.name for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     for r in rows:
         if isinstance(r.get("ts"), datetime):
             r["ts"] = r["ts"].isoformat()

@@ -31,6 +31,7 @@ def mint_jwt(
     exp_seconds: int,
     act: dict[str, Any] | None = None,
     umask: str = "masked",
+    jti: str | None = None,
 ) -> tuple[str, str]:
     """Mint an RS256 JWT. Returns (token, jti).
 
@@ -38,8 +39,14 @@ def mint_jwt(
     database whether the holder should see raw PII ('raw') or masked values
     ('masked'). Defaults to 'masked'. The principal-type floor (roles.py)
     is responsible for downgrading this for agents.
+
+    `jti` is optional — if provided, used as the JWT ID instead of generating
+    a new UUID. This lets callers pre-generate the jti for use as a Cedar
+    TokenRequest entity UID (avoids a circular dependency between the
+    policy decision and the JWT mint).
     """
-    jti = str(uuid.uuid4())
+    if jti is None:
+        jti = str(uuid.uuid4())
     now = int(time.time())
     claims = {
         "iss": config.ISSUER,

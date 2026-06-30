@@ -6,7 +6,8 @@ from fastapi.responses import JSONResponse
 
 from .config import config
 from .db import get_pool, close_pool
-from .routes import jwks, authorize, token, userinfo, introspect
+from .routes import admin_policies, jwks, authorize, token, userinfo, introspect
+from .services.cedar_engine import get_engine
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("control-plane")
@@ -34,6 +35,7 @@ app.include_router(authorize.router)
 app.include_router(token.router)
 app.include_router(userinfo.router)
 app.include_router(introspect.router)
+app.include_router(admin_policies.router)
 
 
 @app.on_event("startup")
@@ -44,12 +46,21 @@ async def startup():
     pool.wait(timeout=10)
     log.info("DB pool ready")
 
-
-@app.on_event("shutdown")
-async def shutdown():
-    close_pool()
+    # Initialize Cedar policy engine
+    engine = get_engine()
+    load_result = engine.load_from_db()
+    if not load_result["ok"]:
+        log.error(f"Cedar policy load failed: {load_result['errors']}")
+        raise RuntimeError(f"Cedar policy load failed: {load_result['errors']}")
+    engine.load_entities_from_db()
+    log.info("Cedar engine ready")
 
 
 @app.get("/health")
 def health():
     return {"status": "ok", "issuer": config.ISSUER}
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    close_pool()

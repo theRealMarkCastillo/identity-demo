@@ -180,6 +180,24 @@ INSERT INTO platform.column_policies VALUES
 GRANT SELECT ON platform.column_policies TO app_session;
 
 -- ----------------------------------------------------------------------------
+-- platform: cedar_policies (Cedar policy engine rules)
+-- Service-level authorization rules evaluated by the cedarpy library. The
+-- runtime source of truth; control-plane/policies/*.cedar files are reference
+-- copies (seeded into this table on first init). UI edits via /policies page.
+-- ----------------------------------------------------------------------------
+CREATE TABLE platform.cedar_policies (
+  policy_id    TEXT PRIMARY KEY,
+  policy_text  TEXT NOT NULL,
+  description  TEXT,
+  enabled      BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+GRANT SELECT ON platform.cedar_policies TO app_session;
+GRANT SELECT, INSERT, UPDATE, DELETE ON platform.cedar_policies TO control_plane_admin;
+
+-- ----------------------------------------------------------------------------
 -- platform: audit_log (security events)
 -- ----------------------------------------------------------------------------
 CREATE TABLE platform.audit_log (
@@ -462,10 +480,67 @@ COMMENT ON VIEW target.transactions_masked IS
   'are masked for principals without raw clearance.';
 
 -- ----------------------------------------------------------------------------
+-- Seed Cedar policies (idempotent — only inserts if table is empty).
+-- The runtime source of truth is platform.cedar_policies; control-plane loads
+-- from this table at startup. UI edits via /policies page mutate the table
+-- directly. Reference copies live in control-plane/policies/*.cedar.
+-- ----------------------------------------------------------------------------
+INSERT INTO platform.cedar_policies (policy_id, policy_text, description)
+SELECT 'token_issuance_v1', $CEDAR$
+permit(
+  principal is User,
+  action == Action::"IssueToken",
+  resource is TokenRequest
+)
+when {
+  (resource.grant_type == "authorization_code" || resource.grant_type == "refresh_token") &&
+  (resource.requested_scopes.isEmpty() ||
+   resource.requested_scopes.containsAny(principal.scopes))
+};
+
+permit(
+  principal is Agent,
+  action == Action::"IssueToken",
+  resource is TokenRequest
+)
+when {
+  resource.grant_type == "token_exchange" &&
+  principal.is_delegatable &&
+  resource.subject_scopes.containsAny(principal.default_scopes)
+};
+
+permit(
+  principal is Agent,
+  action == Action::"IssueToken",
+  resource is TokenRequest
+)
+when {
+  resource.grant_type == "client_credentials" &&
+  (resource.requested_scopes.isEmpty() ||
+   resource.requested_scopes.containsAny(principal.allowed_scopes))
+};
+$CEDAR$, 'Token issuance authorization — 3 grant types (human/refresh, delegated agent, headless agent)'
+WHERE NOT EXISTS (SELECT 1 FROM platform.cedar_policies WHERE policy_id = 'token_issuance_v1');
+
+INSERT INTO platform.cedar_policies (policy_id, policy_text, description)
+SELECT 'masking_compare_v1', $CEDAR$
+permit(
+  principal is User,
+  action == Action::"ViewMaskingComparison",
+  resource is User
+)
+when {
+  principal.role == "senior_analyst"
+};
+$CEDAR$, 'Only senior_analyst can view raw vs masked PII side-by-side'
+WHERE NOT EXISTS (SELECT 1 FROM platform.cedar_policies WHERE policy_id = 'masking_compare_v1');
+
+-- ----------------------------------------------------------------------------
 -- Privileges summary
 -- ----------------------------------------------------------------------------
 -- control_plane_admin: full access to all platform + target (for issuance, lookup)
 -- app_session: SELECT/INSERT/UPDATE on platform.token_records, audit_log, llm_log;
 --              SELECT on platform.users/clients/agents/roles/role_scopes/column_policies;
+--              SELECT on platform.cedar_policies;
 --              full CRUD on target.transactions (RLS still enforced via FORCE);
 --              SELECT on target.transactions_masked (RLS inherited via security_barrier view)

@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Identity Demo - Policies (Cedar)</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 24px; background: #0f172a; color: #e2e8f0; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: #94a3b8; margin: 0 0 8px; }
+    .sub { color: #94a3b8; font-size: 12px; margin-bottom: 20px; line-height: 1.5; }
+    .sub code { background: #1e293b; padding: 2px 5px; border-radius: 3px; color: #fbbf24; }
+    .grid { display: grid; grid-template-columns: 280px 1fr 360px; gap: 16px; margin-bottom: 16px; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+    .card { background: #1e293b; border-radius: 6px; padding: 16px; border: 1px solid #334155; overflow-x: auto; }
+    .card.full { grid-column: 1 / -1; }
+    a { color: #60a5fa; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #334155; }
+    th { color: #94a3b8; font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; }
+    td code { background: #0f172a; padding: 1px 5px; border-radius: 3px; color: #cbd5e1; font-size: 11px; word-break: break-word; }
+    .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; }
+    .badge.yes { background: #064e3b; color: #6ee7b7; }
+    .badge.no  { background: #7f1d1d; color: #fca5a5; }
+    .btn {
+      padding: 6px 12px; background: #2563eb; color: #fff;
+      border: none; font-size: 12px; cursor: pointer; border-radius: 4px;
+      font-family: inherit;
+    }
+    .btn:hover { background: #1d4ed8; }
+    .btn.secondary { background: #475569; }
+    .btn.secondary:hover { background: #334155; }
+    .btn.danger { background: #991b1b; }
+    .btn.danger:hover { background: #7f1d1d; }
+    .btn:disabled { background: #475569; cursor: not-allowed; }
+    textarea {
+      width: 100%; min-height: 280px; padding: 10px;
+      background: #0f172a; color: #e2e8f0; border: 1px solid #334155;
+      border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px; line-height: 1.5; resize: vertical;
+    }
+    textarea:focus { outline: none; border-color: #60a5fa; }
+    .stamp { color: #94a3b8; font-size: 11px; font-family: monospace; }
+    .muted { color: #64748b; font-style: italic; font-size: 11px; }
+    .live-dot {
+      display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+      background: #34d399; margin-right: 6px;
+    }
+    .errors { background: #7f1d1d; color: #fee2e2; padding: 8px 12px; border-radius: 4px; font-family: monospace; font-size: 11px; white-space: pre-wrap; margin-top: 8px; display: none; }
+    .success { background: #064e3b; color: #d1fae5; padding: 8px 12px; border-radius: 4px; font-size: 11px; margin-top: 8px; display: none; }
+    .policy-row { cursor: pointer; }
+    .policy-row.selected { background: #334155; }
+    .policy-row:hover { background: #2a3a52; }
+    .form-row { margin-bottom: 8px; }
+    .form-row label { display: block; font-size: 11px; color: #94a3b8; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .form-row input[type="text"] {
+      width: 100%; padding: 6px 8px; background: #0f172a; color: #e2e8f0;
+      border: 1px solid #334155; border-radius: 4px; font-family: inherit; font-size: 12px;
+    }
+    .form-row input[type="checkbox"] { vertical-align: middle; margin-right: 6px; }
+    .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+    .preview-out { background: #0f172a; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 11px; white-space: pre-wrap; min-height: 60px; }
+    .preview-out.allow { border-left: 3px solid #34d399; }
+    .preview-out.deny { border-left: 3px solid #f87171; }
+  </style>
+</head>
+<body>
+  <h1>Cedar Policies <span style="font-size:12px; color:#94a3b8;">(service-level authz)</span></h1>
+  <div class="sub">
+    Runtime source of truth: Postgres <code>platform.cedar_policies</code>.
+    The control plane loads from this table at startup; UI edits trigger an engine reload.
+    Reference copies in <code>control-plane/policies/*.cedar</code>.
+    · <a href="/admin">← admin dashboard</a>
+    · <a href="/dashboard">← demo dashboard</a>
+  </div>
+
+  <input type="hidden" id="csrf-token" value="{{ csrf_token }}">
+  <input type="hidden" id="control-plane-url" value="{{ control_plane_url }}">
+
+  <div class="grid">
+    <!-- Left: policy list -->
+    <div class="card">
+      <h2>Policies ({{ policies|length }})</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>On</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="policy-tbody">
+          {% for p in policies %}
+          <tr class="policy-row" data-policy-id="{{ p.policy_id }}" onclick="selectPolicy('{{ p.policy_id }}')">
+            <td><code>{{ p.policy_id }}</code></td>
+            <td>
+              <span class="badge {{ 'yes' if p.enabled else 'no' }}">{{ 'YES' if p.enabled else 'NO' }}</span>
+            </td>
+            <td>
+              <button class="btn secondary" onclick="event.stopPropagation(); deletePolicy('{{ p.policy_id }}')">×</button>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <div class="btn-row">
+        <button class="btn" onclick="newPolicy()">+ New</button>
+        <button class="btn secondary" onclick="reloadEngine()">↻ Reload</button>
+      </div>
+      <div id="list-status" class="stamp" style="margin-top:8px;"></div>
+    </div>
+
+    <!-- Center: editor -->
+    <div class="card">
+      <h2>Editor</h2>
+      <div class="form-row">
+        <label for="policy-id-input">Policy ID</label>
+        <input type="text" id="policy-id-input" placeholder="e.g. token_issuance_v2" disabled>
+      </div>
+      <div class="form-row">
+        <label for="policy-desc-input">Description</label>
+        <input type="text" id="policy-desc-input" placeholder="Optional one-liner">
+      </div>
+      <div class="form-row">
+        <label for="policy-text-input">Cedar Policy (surface syntax)</label>
+        <textarea id="policy-text-input" spellcheck="false" placeholder="permit(principal, action, resource);"></textarea>
+      </div>
+      <div class="form-row">
+        <label>
+          <input type="checkbox" id="policy-enabled-input" checked>
+          Enabled
+        </label>
+      </div>
+      <div id="editor-errors" class="errors"></div>
+      <div id="editor-success" class="success"></div>
+      <div class="btn-row">
+        <button class="btn secondary" id="validate-btn" onclick="validatePolicy()">Validate</button>
+        <button class="btn" id="save-btn" onclick="savePolicy()">Save</button>
+      </div>
+    </div>
+
+    <!-- Right: preview sandbox -->
+    <div class="card">
+      <h2>Preview Sandbox</h2>
+      <div class="form-row">
+        <label for="preview-action">Action</label>
+        <input type="text" id="preview-action" value="IssueToken">
+      </div>
+      <div class="form-row">
+        <label for="preview-principal">Principal (JSON)</label>
+        <textarea id="preview-principal" style="min-height:80px;" spellcheck="false">{"type": "User", "id": "user_123"}</textarea>
+      </div>
+      <div class="form-row">
+        <label for="preview-resource">Resource (JSON)</label>
+        <textarea id="preview-resource" style="min-height:80px;" spellcheck="false">{"type": "TokenRequest", "id": "preview-1"}</textarea>
+      </div>
+      <div class="btn-row">
+        <button class="btn secondary" onclick="previewPolicy()">▶ Evaluate</button>
+      </div>
+      <div id="preview-out" class="preview-out" style="margin-top:8px;">Click Evaluate to test the current editor text against the inputs above.</div>
+    </div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h2>Engine Status</h2>
+      <div id="engine-status" class="stamp">Loading…</div>
+      <div class="btn-row">
+        <button class="btn secondary" onclick="refreshEngineStatus()">↻ Refresh</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Recent Policy Audit</h2>
+      <div id="audit-feed" class="stamp">Loading…</div>
+    </div>
+  </div>
+
+<script>
+const CSRF = document.getElementById('csrf-token').value;
+const CP_URL = document.getElementById('control-plane-url').value;
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, {
+    credentials: 'same-origin',
+    ...opts,
+    headers: {'X-CSRF-Token': CSRF, ...(opts.headers || {})},
+  });
+  const text = await r.text();
+  try { return {ok: r.ok, status: r.status, data: JSON.parse(text)}; }
+  catch { return {ok: r.ok, status: r.status, data: text}; }
+}
+
+function clearEditorStatus() {
+  document.getElementById('editor-errors').style.display = 'none';
+  document.getElementById('editor-success').style.display = 'none';
+}
+
+function showEditorErrors(errors) {
+  const el = document.getElementById('editor-errors');
+  el.textContent = Array.isArray(errors) ? errors.join('\n') : String(errors);
+  el.style.display = 'block';
+  document.getElementById('editor-success').style.display = 'none';
+}
+
+function showEditorSuccess(msg) {
+  const el = document.getElementById('editor-success');
+  el.textContent = msg;
+  el.style.display = 'block';
+  document.getElementById('editor-errors').style.display = 'none';
+}
+
+function selectPolicy(policyId) {
+  document.querySelectorAll('.policy-row').forEach(r => r.classList.remove('selected'));
+  document.querySelector(`tr[data-policy-id="${policyId}"]`).classList.add('selected');
+
+  api('/api/policies/' + encodeURIComponent(policyId)).then(({data}) => {
+    document.getElementById('policy-id-input').value = data.policy_id;
+    document.getElementById('policy-id-input').disabled = true;
+    document.getElementById('policy-desc-input').value = data.description || '';
+    document.getElementById('policy-text-input').value = data.policy_text;
+    document.getElementById('policy-enabled-input').checked = data.enabled;
+    clearEditorStatus();
+  });
+}
+
+function newPolicy() {
+  document.querySelectorAll('.policy-row').forEach(r => r.classList.remove('selected'));
+  document.getElementById('policy-id-input').value = '';
+  document.getElementById('policy-id-input').disabled = false;
+  document.getElementById('policy-id-input').placeholder = 'new_policy_id';
+  document.getElementById('policy-desc-input').value = '';
+  document.getElementById('policy-text-input').value = '';
+  document.getElementById('policy-enabled-input').checked = true;
+  clearEditorStatus();
+  document.getElementById('policy-id-input').focus();
+}
+
+async function validatePolicy() {
+  clearEditorStatus();
+  const fd = new FormData();
+  fd.append('csrf_token', CSRF);
+  fd.append('policy_text', document.getElementById('policy-text-input').value);
+  const {ok, data} = await api('/api/policies/validate', {method: 'POST', body: fd});
+  if (ok && data.valid) {
+    showEditorSuccess(`✓ Valid — ${data.policy_count} polic${data.policy_count === 1 ? 'y' : 'ies'} parsed`);
+  } else {
+    showEditorErrors(data.errors || ['unknown error']);
+  }
+}
+
+async function savePolicy() {
+  clearEditorStatus();
+  const policyId = document.getElementById('policy-id-input').value;
+  if (!policyId) { showEditorErrors(['Policy ID is required']); return; }
+  const fd = new FormData();
+  fd.append('csrf_token', CSRF);
+  fd.append('policy_id', policyId);
+  fd.append('policy_text', document.getElementById('policy-text-input').value);
+  fd.append('description', document.getElementById('policy-desc-input').value);
+  fd.append('enabled', document.getElementById('policy-enabled-input').checked ? 'true' : 'false');
+
+  const isExisting = document.getElementById('policy-id-input').disabled;
+  const path = isExisting ? '/api/policies/update' : '/api/policies/create';
+  const {ok, data} = await api(path, {method: 'POST', body: fd});
+  if (ok) {
+    showEditorSuccess(`✓ Saved — engine reloaded`);
+    setTimeout(() => location.reload(), 800);
+  } else {
+    showEditorErrors([data.error || `HTTP ${data.status}`, ...(data.errors || [])]);
+  }
+}
+
+async function deletePolicy(policyId) {
+  if (!confirm(`Delete policy "${policyId}"?`)) return;
+  const fd = new FormData();
+  fd.append('csrf_token', CSRF);
+  fd.append('policy_id', policyId);
+  const {ok, data} = await api('/api/policies/delete', {method: 'POST', body: fd});
+  if (ok) {
+    setTimeout(() => location.reload(), 400);
+  } else {
+    alert(`Delete failed: ${data.error || data.status}`);
+  }
+}
+
+async function reloadEngine() {
+  // Use the control-plane's reload endpoint via a synthetic HTTP call.
+  // Since we don't expose it through the web-app proxy yet, this just hits it directly.
+  try {
+    const r = await fetch(`${CP_URL}/admin/policies/reload`, {method: 'POST'});
+    if (r.ok) {
+      document.getElementById('list-status').textContent = '✓ engine reloaded';
+      setTimeout(refreshEngineStatus, 500);
+    } else {
+      document.getElementById('list-status').textContent = `✗ reload failed: ${r.status}`;
+    }
+  } catch (e) {
+    document.getElementById('list-status').textContent = `✗ control-plane unreachable`;
+  }
+}
+
+async function previewPolicy() {
+  const out = document.getElementById('preview-out');
+  out.classList.remove('allow', 'deny');
+  out.textContent = 'Evaluating…';
+  const fd = new FormData();
+  fd.append('csrf_token', CSRF);
+  fd.append('policy_text', document.getElementById('policy-text-input').value);
+  fd.append('entities_json', '[]');
+  fd.append('principal', document.getElementById('preview-principal').value);
+  fd.append('action', document.getElementById('preview-action').value);
+  fd.append('resource', document.getElementById('preview-resource').value);
+
+  const {ok, data} = await api('/api/policies/preview', {method: 'POST', body: fd});
+  if (!ok) {
+    out.classList.add('deny');
+    out.textContent = `✗ Error: ${data.error || data.status}\n${(data.errors || []).join('\n')}`;
+    return;
+  }
+  if (!data.valid) {
+    out.classList.add('deny');
+    out.textContent = `✗ Policy parse error:\n${(data.errors || []).join('\n')}`;
+    return;
+  }
+  out.classList.add(data.allowed ? 'allow' : 'deny');
+  const verdict = data.allowed ? '✓ ALLOW' : '✗ DENY';
+  out.textContent = `${verdict}\n\nreasons: ${(data.reasons || []).join(', ') || '(none)'}\nerrors: ${(data.errors || []).join(', ') || '(none)'}`;
+}
+
+async function refreshEngineStatus() {
+  try {
+    const r = await fetch(`${CP_URL}/admin/policies/reload`, {method: 'POST'});
+    const data = await r.json();
+    document.getElementById('engine-status').textContent =
+      `control-plane: ${CP_URL}\nlast reload: ${JSON.stringify(data)}`;
+  } catch (e) {
+    document.getElementById('engine-status').textContent = `control-plane unreachable: ${e}`;
+  }
+}
+
+async function refreshAuditFeed() {
+  try {
+    const r = await fetch('/api/audit-feed?limit=20', {credentials: 'same-origin'});
+    const rows = await r.json();
+    const policyRows = rows.filter(x => (x.event_type || '').startsWith('admin_policy'));
+    const html = policyRows.length
+      ? policyRows.slice(0, 10).map(r => `<div>${r.ts} <code>${r.event_type}</code> ${JSON.stringify(r.details || {})}</div>`).join('')
+      : '<div class="muted">No policy audit events yet.</div>';
+    document.getElementById('audit-feed').innerHTML = html;
+  } catch (e) {
+    document.getElementById('audit-feed').textContent = `Audit feed unavailable: ${e}`;
+  }
+}
+
+refreshEngineStatus();
+refreshAuditFeed();
+setInterval(refreshAuditFeed, 10000);
+</script>
+</body>
+</html>

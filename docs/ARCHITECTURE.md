@@ -139,11 +139,11 @@ The core identity propagation pattern: the application sets Postgres session var
 
 | Tier | What enforces it | Example |
 |---|---|---|
-| 1. Token scope | Control plane at issuance | Agent JWT has `scope=read:transactions` — the web app can check this without a DB call |
-| 2. Role mapping | `platform.roles` + `platform.role_scopes` in the DB | `senior_analyst` gets R+W, `junior_analyst` gets R only |
+| 1. Cedar policy engine | `cedarpy` library in the control plane, policies from `platform.cedar_policies` table | Token issuance: Cedar evaluates whether a principal can request given scopes (e.g., senior with `.full`, junior without, agent delegation) |
+| 2. Token scope + umask | `derive_token_attrs()` in `control-plane/app/services/roles.py` | Agent JWT gets `scope=read:transactions`, `umask=masked` |
 | 3. Row-level security | Postgres RLS policies | `owner_user_id = current_user_id()`; agent can't read rows it doesn't own |
 
-No single layer is trusted to get it right. The database is the last and strongest line.
+Cedar handles the permit/deny gate ("is this principal allowed to request these scopes?"). RLS is the last and strongest data-layer line of defense. No single layer is trusted to get it right.
 
 ### Why a separate authorization server?
 
@@ -401,12 +401,19 @@ sequenceDiagram
     autonumber
     participant U as User
     participant CP as Control Plane
+    participant CEDAR as Cedar Engine<br/>(in-process)
     participant WA as Web App
     participant DB as Postgres
 
     U->>CP: Login / RFC 8693 exchange
-    CP->>CP: effective_scopes = role ∩ requested<br/>umask = compute_umask(effective, is_agent)
-    Note over CP: is_agent=True ⇒ umask='masked' (floor)<br/>else: any '.full' in effective ⇒ 'raw'
+    CP->>CEDAR: is_authorized(IssueToken,<br/>principal=User/Agent, resource=TokenRequest)
+    Note over CEDAR: token_issuance.cedar permit rules:<br/>human scopes ∩ role_scopes, or<br/>agent subject_scopes ∩ default_scopes
+    CEDAR-->>CP: allow | deny
+    alt Cedar denies
+        CP-->>U: 400 invalid_scope
+    end
+    CP->>CP: effective_scopes = role ∩ requested<br/>umask = derive_token_attrs(effective, type)
+    Note over CP: type='agent' ⇒ umask='masked' (floor)<br/>else: any '.full' in effective ⇒ 'raw'
     CP->>U: JWT (scope, umask claim)
     WA->>DB: BEGIN
     WA->>DB: SET LOCAL app.user_id, app.actor_id<br/>SET LOCAL app.unmask_level = umask
@@ -438,11 +445,13 @@ update — no view changes, no recompilation.
 Even if an agent's `default_scopes` contains `read:transactions.full`, three
 independent checks keep the agent from seeing raw values:
 
-1. **Control plane**: `roles.strip_full_suffix()` removes `.full` from any
-   scope in the agent's effective `scope` claim. The claim honestly reflects
-   what the agent can do.
-2. **Control plane**: `roles.compute_umask(..., is_agent=True)` forces
-   `umask='masked'` regardless of which scopes are in the effective set.
+1. **Control plane (Cedar)**: the `token_issuance.cedar` policy evaluates
+   whether the agent is permitted to request these scopes at all. Cedar gates
+   the request; if allowed, Python continues.
+2. **Control plane (Python)**: `derive_token_attrs()` strips `.full` from the
+   agent's effective `scope` claim and forces `umask='masked'` regardless of
+   which scopes Cedar allowed. The `scope` claim honestly reflects what the
+   agent can actually do.
 3. **Database**: `apply_mask()` reads `app.unmask_level` and skips masking
    only if it's the literal string `'raw'`. The web app reads this string
    verbatim from the JWT's `umask` claim — there's no path through the
@@ -475,8 +484,9 @@ PII, when, and what was exposed."
 
 | Layer | Where | What changes | Touch cost |
 |---|---|---|---|
-| Scope → umask | `control-plane/app/services/roles.py` `compute_umask` | Code | Control plane redeploy |
-| Floor (strip `.full`) | `control-plane/app/services/roles.py` `strip_full_suffix` | Code | Control plane redeploy |
+| Cedar gate (IssueToken) | `platform.cedar_policies` table + `cedar_engine.py` | Data (UI / API) | None — policies reload immediately |
+| Scope → umask | `control-plane/app/services/roles.py` `derive_token_attrs` | Code | Control plane redeploy |
+| Floor (strip `.full`) | `control-plane/app/services/roles.py` `derive_token_attrs` | Code | Control plane redeploy |
 | Mask policies | `platform.column_policies` (table) | Data (cli-admin) | None |
 | Mask function | `db/init.sql` `apply_mask` | Code | `make reset` |
 | Masked view | `db/init.sql` `target.transactions_masked` | Code | `make reset` |
@@ -522,18 +532,31 @@ The mapping from "role/agent" → "allowed scopes" is **data**, not code. Changi
 | `platform.agents` | `db/init.sql:105` (DDL) | Agent catalog with `default_scopes TEXT[]` column — what scope an agent gets by default during delegation |
 | `platform.clients` | `db/init.sql` (DDL) | OAuth client registry (web app + headless agents) with per-client `allowed_scopes` |
 
-#### Layer 3: Scope computation (Python services in the control plane)
+#### Layer 3: Cedar policy engine (service-level gate)
 
-The control plane reads the data tables above and computes the **effective scope** for each token issuance. This is **code**, not data — changing it requires redeploying the control plane.
+The control plane uses the `cedarpy` library to evaluate **permit/deny** decisions at token issuance time. Policies live in the `platform.cedar_policies` table (runtime source of truth) and are editable via the `/policies` UI. Reference copies live in `control-plane/policies/*.cedar`.
+
+| File | What it does |
+|---|---|
+| `control-plane/policies/token_issuance.cedar` | 3 permit rules: humans (auth_code/refresh), delegated agents (token_exchange), headless agents (client_credentials) |
+| `control-plane/policies/masking_compare.cedar` | Gates the masking-comparison endpoint to senior_analyst only |
+| `control-plane/app/services/cedar_engine.py` | Wraps `cedarpy`: PolicySet loading, entity building, decide/validate/preview |
+| `control-plane/app/services/entity_builder.py` | Builds Cedar entity JSON from `platform.users`, `platform.role_scopes`, `platform.agents`, `platform.clients` |
+| `control-plane/app/routes/admin_policies.py` | CRUD, validate, preview, reload endpoints for `platform.cedar_policies` |
+| `web-app/app/routes/policies.py` | `/policies` UI page + proxy endpoints to control-plane |
+| `web-app/templates/policies.html` | UI: policy list, editor, validate/save, preview sandbox |
+
+#### Layer 4: Scope computation (Python helpers)
+
+After Cedar says yes, Python computes the actual JWT claim values. These are **code**, not data — changing them requires redeploying the control plane.
 
 | File | Function | What it does |
 |---|---|---|
-| `control-plane/app/services/roles.py:7` | `get_role_scopes(role)` | Reads `platform.role_scopes` for a role |
-| `control-plane/app/services/roles.py:17` | `compute_effective_scopes(role, requested)` | `role_scopes ∩ requested` — the downscope formula for human users |
-| `control-plane/app/services/roles.py:24` | `compute_umask(scopes, is_agent)` | Returns `raw` iff any scope has `.full` AND `is_agent=False`; else `masked` (the principal-type floor) |
-| `control-plane/app/services/roles.py:31` | `strip_full_suffix(scopes)` | Removes `.full` from scope strings; applied to agent-issued tokens so the `scope` claim reflects what the agent can actually do |
+| `control-plane/app/services/roles.py` | `get_role_scopes(role)` | Reads `platform.role_scopes` for a role |
+| `control-plane/app/services/roles.py` | `compute_effective_scopes_local(role, requested)` | `role_scopes ∩ requested` — the downscope formula for JWT claims |
+| `control-plane/app/services/roles.py` | `derive_token_attrs(scopes, type)` | Returns `{effective_scopes, umask, floor_stripped}` — the principal-type floor + `.full` stripping |
 | `control-plane/app/services/agents.py` | `get_agent(agent_id)` | Reads `platform.agents.default_scopes` for token exchange |
-| `control-plane/app/routes/token.py` | grant handlers | Calls the above at issuance time for all four grant types |
+| `control-plane/app/routes/token.py` | grant handlers | Calls Cedar gate first, then Python helpers for JWT minting |
 
 #### The "what do I change to allow X?" cheat sheet
 
@@ -543,9 +566,11 @@ The control plane reads the data tables above and computes the **effective scope
 | Change what an existing role can do | `UPDATE/INSERT/DELETE` on `platform.role_scopes` | No |
 | Add a new agent | `INSERT INTO platform.agents (agent_id, default_scopes, is_delegatable)` | No |
 | Change what an agent gets by default | `UPDATE platform.agents SET default_scopes = ...` | No |
-| Add a new scope string (e.g., `delete:transactions`) | 1) New RLS policy in `db/init.sql` <br> 2) Add to `platform.role_scopes` for human roles <br> 3) Add to `platform.agents.default_scopes` for agents <br> 4) Add to web app's tool definitions | **Yes** for (1) and (4) — `make reset` + web app redeploy. (2) and (3) are data changes. |
-| Change the downscope formula | `control-plane/app/services/roles.py` | **Yes** — control plane redeploy |
-| Change the principal-type floor (e.g., allow agents raw PII on a column) | `control-plane/app/services/roles.py` (`compute_umask`/`strip_full_suffix`) | **Yes** — control plane redeploy |
+| Edit a Cedar policy (token issuance rules) | `/policies` UI or `UPDATE platform.cedar_policies SET policy_text = ...` | No — engine reloads immediately |
+| Add a new Cedar policy | `/policies` UI (`+ New`) or `INSERT INTO platform.cedar_policies` | No — engine reloads immediately |
+| Add a new scope string (e.g., `delete:transactions`) | 1) New RLS policy in `db/init.sql` <br> 2) Add to `platform.role_scopes` for human roles <br> 3) Add to `platform.agents.default_scopes` for agents <br> 4) Update Cedar policy in `platform.cedar_policies` to permit it <br> 5) Add to web app's tool definitions | **Yes** for (1), (4), and (5) — `make reset` + redeploys. (2) and (3) are data changes. |
+| Change the downscope formula / principal-type floor | `control-plane/app/services/roles.py` (`derive_token_attrs`) | **Yes** — control plane redeploy |
+| Change Cedar policy evaluation (add new actions, entities) | `control-plane/policies/*.cedar` (reference) + `control-plane/app/services/cedar_engine.py` / `entity_builder.py` | **Yes** — control plane redeploy |
 | Add a new PII column with masking | 1) `ALTER TABLE target.<t> ADD COLUMN <c>`, populate <br> 2) `INSERT INTO platform.column_policies` <br> 3) Add `apply_mask(...)` call in the masked view <br> 4) `SELECT` the new column in `web-app/app/tools.py` | **Yes** for (3) and (4) — `make reset` + web app redeploy. (2) is data. |
 | Change a column's mask type or params | `UPDATE platform.column_policies` (or `cli-admin column-policy update`) | No — picked up on next query |
 | Change who can write at all | `db/init.sql` `modify_human_only` policy | **Yes** — `make reset` |
@@ -553,13 +578,14 @@ The control plane reads the data tables above and computes the **effective scope
 
 #### Why this split?
 
-This is **policy-as-data + policy-as-code**, deliberately:
+This is **policy-as-data + policy-as-code + Cedar**, deliberately:
 
 - **Roles and agent defaults are data** because business changes frequently ("junior analyst gets read-only of shared rows too"). Data changes ship in seconds via SQL, no engineering ticket.
 - **RLS policies are code** because they're security-critical and changing them should require a code review, a schema migration, and a rebuild. You don't want a junior engineer changing `modify_human_only` via a UI.
-- **Scope computation is code** because it's the trust boundary — the `effective = subject.scopes ∩ agent.scopes` line is *the* delegation-safety invariant. It deserves the rigor of a code review.
+- **Cedar policies are data** (in `platform.cedar_policies`) because they need to be editable at runtime — token issuance rules, scope-gating, and masking-comparison authorization should be tunable without redeploying the control plane. Cedar evaluates them live; the `/policies` UI provides inline validation and a preview sandbox.
+- **Scope computation (derive_token_attrs) is code** because it's the trust boundary — the "umask = masked for agents" line is *the* delegation-safety invariant. It deserves the rigor of a code review.
 
-The trade-off: the "what changes require what" matrix above is the operational cost. In production you'd add policy-as-code tools (OPA, Cedar) and a CI check that flags `platform.role_scopes` changes without an accompanying change ticket.
+The trade-off: the "what changes require what" matrix above is the operational cost. This demo now **has** the policy-as-code tool (Cedar) that earlier versions flagged as a future production improvement.
 
 ## 7. OAuth Flows (Sequence)
 
@@ -573,6 +599,7 @@ sequenceDiagram
     participant U as Browser
     participant W as Web App
     participant CP as Control Plane
+    participant CEDAR as Cedar Engine<br/>(in-process)
     participant DB as Postgres
 
     U->>W: Click "Sign in"
@@ -587,11 +614,17 @@ sequenceDiagram
     U->>W: GET /callback?code=...
     W->>CP: POST /oauth/token (grant_type=authorization_code, code, code_verifier)
     CP->>CP: Verify code_challenge matches SHA256(code_verifier)
-    CP->>DB: SELECT role → compute effective scopes
+    CP->>CEDAR: is_authorized(IssueToken,<br/>principal=User, resource=TokenRequest(grant_type=authorization_code, requested))
+    Note over CEDAR: token_issuance.cedar: humans<br/>require role_scopes ∩ requested ≠ ∅
+    CEDAR-->>CP: allow | deny
+    alt Cedar denies
+        CP-->>W: 400 invalid_scope
+    end
+    CP->>CP: effective_scopes = role ∩ requested<br/>derive_token_attrs(effective, type='human')
     CP->>CP: Mint access JWT (RS256), generate refresh token
     CP->>DB: INSERT platform.token_records (jti, sub, scope, exp)
     CP->>DB: INSERT platform.audit_log (event=token_issue, sub=user)
-    CP-->>W: access_token, refresh_token, scope
+    CP-->>W: access_token, refresh_token, scope, umask
     W->>W: Store tokens in signed session cookie (itsdangerous)
     W-->>U: 302 redirect → /dashboard
 ```
@@ -603,6 +636,7 @@ sequenceDiagram
     autonumber
     participant W as Web App
     participant CP as Control Plane
+    participant CEDAR as Cedar Engine<br/>(in-process)
     participant DB as Postgres
 
     Note over W: User clicked "Copilot" — has a valid access JWT in session
@@ -611,14 +645,17 @@ sequenceDiagram
     CP->>CP: Verify subject JWT signature (own public key)
     CP->>DB: SELECT agent WHERE agent_id=agent_copilot_99
     DB-->>CP: agent + default_scopes + is_delegatable
-    CP->>CP: effective = subject.scope ∩ agent.default_scopes
-    alt effective is empty
+    CP->>CEDAR: is_authorized(IssueToken,<br/>principal=Agent, resource=TokenRequest(grant_type=token_exchange, subject_scopes))
+    Note over CEDAR: token_issuance.cedar: delegated agent requires<br/>is_delegatable AND subject_scopes ∩ default_scopes ≠ ∅
+    CEDAR-->>CP: allow | deny
+    alt Cedar denies (or effective empty)
         CP-->>W: 400 invalid_scope
     end
+    CP->>CP: effective = subject.scope ∩ agent.default_scopes<br/>derive_token_attrs(effective, type='agent') ⇒ umask='masked', strip .full
     CP->>CP: Mint NEW JWT (sub=user, act.sub=agent, scope=effective)
     CP->>DB: INSERT platform.token_records (jti, sub=user, act_sub=agent)
     CP->>DB: INSERT platform.audit_log (event=token_exchange, sub=user, act_sub=agent)
-    CP-->>W: access_token, issued_token_type=jwt, scope
+    CP-->>W: access_token, issued_token_type=jwt, scope, umask
     W->>DB: BEGIN
     W->>DB: SET LOCAL app.user_id = <user><br/>SET LOCAL app.actor_id = <agent>
     W->>DB: (tool query) — RLS enforces delegated read-only on user's rows
@@ -633,6 +670,7 @@ sequenceDiagram
     autonumber
     participant A as cli-agent
     participant CP as Control Plane
+    participant CEDAR as Cedar Engine<br/>(in-process)
     participant DB as Postgres
 
     A->>CP: POST /oauth/token<br/>Authorization: Basic base64(agent_etl_nightly:secret)<br/>grant_type=client_credentials&scope=read:transactions
@@ -642,11 +680,17 @@ sequenceDiagram
     CP->>DB: SELECT client_type → 'agent'
     CP->>DB: SELECT agent.default_scopes WHERE agent_id=client_id
     DB-->>CP: default_scopes
-    CP->>CP: effective = requested ∩ agent.default_scopes (or default if none requested)
+    CP->>CEDAR: is_authorized(IssueToken,<br/>principal=Agent, resource=TokenRequest(grant_type=client_credentials, requested))
+    Note over CEDAR: token_issuance.cedar: headless agent requires<br/>requested_scopes ⊆ allowed_scopes (from platform.clients)
+    CEDAR-->>CP: allow | deny
+    alt Cedar denies
+        CP-->>A: 400 invalid_scope
+    end
+    CP->>CP: effective = requested ∩ allowed_scopes (or all if empty)<br/>derive_token_attrs(effective, type='agent') ⇒ umask='masked'
     CP->>CP: Mint JWT (sub=agent_id, scope=effective, NO act claim)
     CP->>DB: INSERT platform.token_records (jti, sub=agent)
     CP->>DB: INSERT platform.audit_log (event=token_issue_principal=agent)
-    CP-->>A: access_token, scope, expires_in
+    CP-->>A: access_token, scope, expires_in, umask
     A->>DB: BEGIN
     A->>DB: SET LOCAL app.user_id = '' (NULL)<br/>SET LOCAL app.actor_id = <agent>
     A->>DB: (tool query) — RLS enforces headless sees only shared rows
@@ -742,6 +786,60 @@ sequenceDiagram
     A->>U: I lost authorization mid-conversation. Please re-delegate.
 ```
 
+### 7.7 Cedar Policy Engine (service-level authorization)
+
+The Cedar engine is an in-process component of the control plane. It loads policies from `platform.cedar_policies` at startup, hot-reloads them on every save, and answers `is_authorized()` calls at token issuance time. The web-app `/policies` UI provides full CRUD with inline validation and a preview sandbox.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User (browser)
+    participant WA as Web App
+    participant CP as Control Plane
+    participant CEDAR as Cedar Engine
+    participant DB as Postgres
+
+    Note over CP,CEDAR: At startup: cedar_engine.load_from_db()<br/>loads enabled rows from platform.cedar_policies<br/>into an immutable cedarpy.PolicySet handle
+
+    U->>WA: Open /policies, edit a policy
+    WA->>CP: POST /admin/policies (validate policy_text first)
+    CP->>CP: cedarpy.PolicySet.from_str(text)<br/>catch ValueError → 400 invalid_policy
+    CP->>DB: INSERT/UPDATE platform.cedar_policies
+    CP->>CEDAR: engine.reload()
+    Note over CEDAR: with_added_str adds the new policy<br/>without reparsing the existing PolicySet
+    CP->>DB: INSERT platform.audit_log (event=admin_policy_*)
+    CP-->>WA: 200 created/updated
+
+    U->>WA: Click "Preview" with test inputs
+    WA->>CP: POST /admin/policies/preview
+    CP->>CEDAR: is_authorized(request, draft_policy, entities)
+    CEDAR-->>CP: {allowed, reasons, errors}
+    CP-->>WA: preview result (no persist)
+
+    Note over U,CEDAR: Later — a real token issuance uses the new policy
+    U->>CP: POST /oauth/token
+    CP->>CEDAR: is_authorized(IssueToken, principal, TokenRequest)
+    CEDAR-->>CP: allow | deny (uses updated PolicySet)
+```
+
+#### Cedar entity model
+
+The engine uses two base entity types built from `platform.*` tables at startup, plus a per-request `TokenRequest` entity added via `with_added_json_str()` delta:
+
+| Entity | Built from | Attributes |
+|---|---|---|
+| `User::"<user_id>"` | `platform.users` + `platform.role_scopes` | `role: String`, `scopes: Set<String>` (denormalized from role_scopes) |
+| `Agent::"<agent_id>"` | `platform.agents` + `platform.clients` | `is_delegatable: Bool`, `default_scopes: Set<String>`, `allowed_scopes: Set<String>` |
+| `TokenRequest::"<jti>"` | per-request | `grant_type`, `requested_scopes`, `subject_scopes`, `client_type` |
+
+The action set is small: `Action::"IssueToken"` (gates all 4 grant types) and `Action::"ViewMaskingComparison"` (gates the masking demo).
+
+#### When to use Cedar vs other layers
+
+- **Cedar** (service-level): who is *permitted* to request which scopes. UI-editable; hot-reloads.
+- **`derive_token_attrs()`** (control plane Python): computes the *actual* JWT claim values (umask, scope) from post-Cedar inputs. Code; redeploy to change.
+- **RLS** (data level): which rows a connection can see. SQL DDL; `make reset` to change.
+
 ## 8. Threat Model
 
 This section enumerates the threats this demo defends against, the mechanism that stops each, and the threats that fall outside the demo's scope. It's the bridge between the design decisions (§3) and the security properties (§11): every defense has a corresponding threat, and vice versa.
@@ -782,7 +880,7 @@ These are real threats, but they're explicitly out of scope. Each is mitigated i
 | **LLM prompt injection bypasses tool guards** | The LLM is trusted to follow its system prompt; tools execute whatever the LLM asks for | Output filtering, structured tool constraints, separate "action approval" model, human-in-the-loop for destructive ops |
 | **Denial of service** | Demo has no rate limiting | Rate limiting at the edge, WAF, autoscaling, circuit breakers |
 | **Token theft via browser extensions / XSS** | Demo doesn't have CSP or strict cookie attributes | Strict CSP, `SameSite=strict` cookies, `__Host-` cookie prefix, output encoding |
-| **Authorization policy drift** (someone changes `platform.role_scopes` and breaks things silently) | No version history on the policy tables — see §13 | Policy-as-code (OPA, Cedar), change tracking, policy diffs in CI |
+| **Authorization policy drift** (someone changes `platform.role_scopes` and breaks things silently) | No version history on the policy tables — see §13 | Cedar policies in `platform.cedar_policies` are version-controlled via the engine reload log; changes are audited via `admin_policy_*` events. Role/agent data changes still lack version history. |
 
 ### Residual risks (within scope, but worth naming)
 
@@ -834,7 +932,7 @@ A: Two things. (1) The control plane verifies the actor exists in `platform.agen
 A: An API gateway injecting user identity is a *trust* mechanism — if the gateway is misconfigured or compromised, the wrong identity propagates everywhere. RS256 JWTs are a *cryptographic* mechanism — every layer verifies the signature independently. The database doesn't have to trust the web app or the gateway; it verifies the token itself. Trust assumptions scale linearly with components; cryptographic verification scales with the key strength.
 
 **Q: Why not use OPA (Open Policy Agent) instead of Postgres RLS?**
-A: OPA is excellent for centralized policy across many services with Rego DSL. Postgres RLS is excellent for row-level enforcement with low latency in the database itself. They're complementary. This demo uses RLS because the database is the last line of defense for *row-level* access — and pushing every row check to an external service adds latency and a network dependency. In production, OPA and RLS often coexist: OPA for service-level authz, RLS for data-level authz.
+A: OPA is excellent for centralized policy across many services with Rego DSL. Postgres RLS is excellent for row-level enforcement with low latency in the database itself. They're complementary. This demo now uses **Cedar** for service-level authorization (token issuance decisions, masking-comparison gate) and RLS for data-level defense-in-depth. In production, Cedar/OPA and RLS often coexist: Cedar for service-level authz, RLS for data-level authz.
 
 **Q: Why not pass user identity as a query parameter?**
 A: Three reasons (see §3 "Postgres RLS via GUCs"): (1) query parameters can be tampered with via SQL injection even with parameterization — GUCs are set server-side, not in SQL text; (2) GUCs don't appear in `pg_stat_statements` or query logs, so identity doesn't leak; (3) `SET LOCAL` is transaction-scoped, safe under connection pooling.
@@ -976,7 +1074,7 @@ Terms used throughout this document, with the precise meaning intended here.
 | **Scope** | A named permission, e.g., `read:transactions`, `write:transactions`. Issued by the control plane and bound to a JWT at issuance. Enforced by both the web app (token scope check) and the database (RLS). |
 | **Role** | A named bundle of scopes assigned to a human user (e.g., `senior_analyst` → R+W; `junior_analyst` → R). Roles live in `platform.roles` and `platform.role_scopes`. Roles only apply to human users — agents get scopes directly from `platform.agents.default_scopes`. |
 | **umask** | An internal JWT claim (`umask`) set by the control plane at issuance. Value is `'raw'` if the bearer has raw-PII clearance, otherwise `'masked'`. Read by the web app and pushed down to Postgres as the `app.unmask_level` GUC; the DB's `apply_mask()` reads it to decide cell-level masking. Defaults to `'masked'`. |
-| **Principal-type floor** | The control-plane rule that any token minted for a non-human principal (delegated agent with `act` set, or client-credentials / headless agent) is always forced to `umask='masked'` regardless of which `.full` scopes it would otherwise carry. Implemented in `control-plane/app/services/roles.py` (`compute_umask`, `strip_full_suffix`). |
+| **Principal-type floor** | The control-plane rule that any token minted for a non-human principal (delegated agent with `act` set, or client-credentials / headless agent) is always forced to `umask='masked'` regardless of which `.full` scopes it would otherwise carry. Implemented in `control-plane/app/services/roles.py` (`derive_token_attrs`). |
 | **Masking policy** | A row in `platform.column_policies` describing how a sensitive column should be transformed when the bearer lacks raw clearance. Defines `mask_type` (`full`/`partial`/`hash`/`null`) and optional `mask_params` (e.g., `{"visible_tail": 4}`). Edited via `cli-admin column-policy ...`. |
 | **Masked view** | A Postgres `security_barrier` view (`target.transactions_masked`) that selects through `apply_mask()` for every PII column. Tools query this view, not the base table, so cells get masked automatically while RLS still controls rows. |
 | **apply_mask()** | PL/pgSQL function (in `db/init.sql`) that takes `(table_name, column_name, raw_value, row_pk)` and returns either the raw value or the policy-mandated transformation, based on `app.unmask_level`. Writes an `unmask_access` row to the audit log when a PII column returns raw. |
@@ -1088,10 +1186,13 @@ The demo's value isn't the custom control plane — it's the **end-to-end identi
 │   └── init.sql                 # Schemas, tables, RLS, masking engine, masked view, seed
 ├── control-plane/               # FastAPI OAuth 2.1 + RFC 8693 server
 │   ├── Dockerfile
-│   ├── requirements.txt
+│   ├── requirements.txt         # includes cedarpy==4.8.6
 │   ├── keys/signing.pem         # RS256 key (generated by scripts/gen_keys.py)
+│   ├── policies/                # Reference Cedar policies (runtime source: platform.cedar_policies table)
+│   │   ├── token_issuance.cedar # 3 permit rules for token issuance
+│   │   └── masking_compare.cedar # Gates masking-comparison to senior_analyst
 │   └── app/
-│       ├── main.py              # FastAPI app
+│       ├── main.py              # FastAPI app + Cedar engine bootstrap
 │       ├── config.py            # env-driven config
 │       ├── db.py                # psycopg pool
 │       ├── jwt_utils.py         # mint/verify JWT (with umask claim), PKCE
@@ -1099,16 +1200,19 @@ The demo's value isn't the custom control plane — it's the **end-to-end identi
 │       ├── routes/
 │       │   ├── jwks.py          # /.well-known/jwks.json
 │       │   ├── authorize.py     # /authorize (login form)
-│       │   ├── token.py         # /oauth/token (4 grant types; sets umask + applies floor)
+│       │   ├── token.py         # /oauth/token (4 grant types; Cedar gate + derive_token_attrs)
 │       │   ├── userinfo.py      # /oauth/userinfo (OIDC)
-│       │   └── introspect.py    # /oauth/introspect, /oauth/revoke
+│       │   ├── introspect.py    # /oauth/introspect, /oauth/revoke
+│       │   └── admin_policies.py # /admin/policies CRUD + validate + preview + reload + internal/decide
 │       ├── services/
 │       │   ├── users.py         # BCrypt password verify
 │       │   ├── clients.py       # BCrypt client_secret verify
 │       │   ├── agents.py        # Agent registration lookup
-│       │   ├── roles.py         # Role/scope + umask computation + principal-type floor
+│       │   ├── roles.py         # Scope loader + derive_token_attrs (umask + .full stripping)
 │       │   ├── codes.py         # In-memory auth codes + refresh tokens
-│       │   └── audit.py         # platform.audit_log + token_records writes
+│       │   ├── audit.py         # platform.audit_log + token_records writes
+│       │   ├── cedar_engine.py  # Cedar policy engine wrapper (decide/validate/preview/reload)
+│       │   └── entity_builder.py # Cedar entity JSON from platform.* tables
 │       └── templates/login.html
 ├── web-app/                     # FastAPI + Jinja UI
 │   ├── Dockerfile
@@ -1124,8 +1228,14 @@ The demo's value isn't the custom control plane — it's the **end-to-end identi
 │       ├── session.py           # itsdangerous session + CSRF
 │       └── routes/
 │           ├── ui.py            # /login, /callback, /dashboard
-│           ├── actions.py       # /action/*, /chat/*, /api/*, /revoke/* (umask plumbing, masking demos)
-│           └── admin.py         # /admin (read-only: roles/agents/clients/column_policies)
+│           ├── actions.py       # /action/*, /chat/*, /api/*, /revoke/* (umask plumbing + Cedar masking gate)
+│           ├── admin.py         # /admin (read-only: roles/agents/clients/column_policies)
+│           └── policies.py      # /policies (Cedar policy management UI + proxy endpoints)
+├── templates/
+│   ├── login.html               # Login form
+│   ├── dashboard.html           # Demo dashboard (JWTs, actions, chat, feeds)
+│   ├── admin.html               # Read-only admin dashboard
+│   └── policies.html            # Cedar policy editor + preview sandbox
 ├── cli-agent/                   # Headless OAuth 2.1 client
 │   ├── README.md
 │   ├── requirements.txt
@@ -1148,6 +1258,9 @@ The demo's value isn't the custom control plane — it's the **end-to-end identi
     ├── conftest.py              # Shared fixtures (stack-up wait, DB connection helper)
     ├── test_oauth.py            # OAuth 2.1 grant-type behavior
     ├── test_rls.py              # RLS branches: human/delegated/headless + audit
-    └── test_masking.py          # Column-level masking: 4 principal paths + edge cases
+    ├── test_masking.py          # Column-level masking: 4 principal paths + derive_token_attrs
+    └── unit/
+        ├── conftest.py          # Overrides stack-up wait (unit tests are pure)
+        └── test_cedar_policies.py # Cedar policy unit tests: 6 permit rules, validation, preview
 ```
 ```

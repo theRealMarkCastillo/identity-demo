@@ -192,36 +192,51 @@ def _import_roles_module():
     return importlib.import_module("app.services.roles")
 
 
-def test_compute_umask_forces_masked_for_agents():
-    """Even if an agent's effective scopes include `.full`, compute_umask
-    always returns 'masked' for principals where is_agent=True. This is the
-    principal-type floor in code form; it has the last word at issuance.
+def test_derive_token_attrs_enforces_principal_type_floor():
+    """derive_token_attrs always returns umask='masked' for agents, regardless
+    of whether the effective scopes include `.full`. For humans, returns
+    'raw' iff any scope ends with .full. This is the principal-type floor in
+    code form; it has the last word at issuance.
     """
     roles = _import_roles_module()
     # Human with .full -> raw
-    assert roles.compute_umask(["read:transactions.full"], is_agent=False) == "raw"
+    assert roles.derive_token_attrs(["read:transactions.full"], "human")["umask"] == "raw"
     # Human without .full -> masked
-    assert roles.compute_umask(["read:transactions"], is_agent=False) == "masked"
+    assert roles.derive_token_attrs(["read:transactions"], "human")["umask"] == "masked"
     # Agent with .full -> masked (floor)
-    assert roles.compute_umask(["read:transactions.full"], is_agent=True) == "masked"
+    assert roles.derive_token_attrs(["read:transactions.full"], "agent")["umask"] == "masked"
     # Agent with mixed -> masked
-    assert roles.compute_umask(["read:transactions", "read:transactions.full"], is_agent=True) == "masked"
+    assert roles.derive_token_attrs(["read:transactions", "read:transactions.full"], "agent")["umask"] == "masked"
 
 
-def test_strip_full_suffix_cleans_scope_claim():
+def test_derive_token_attrs_strips_full_suffix_for_agents():
     """Agent-issued tokens expose a scope claim with `.full` stripped AND
     deduplicated (the base scope and its `.full` variant collapse to one
     string) so the claim honestly reflects what the bearer can actually see.
+    Humans keep .full in their scope claim.
     """
     roles = _import_roles_module()
-    assert roles.strip_full_suffix(
-        ["read:transactions", "read:transactions.full"]
-    ) == ["read:transactions"]
-    assert roles.strip_full_suffix(
-        ["read:transactions.full", "read:transactions"]
-    ) == ["read:transactions"]
-    assert roles.strip_full_suffix(["read:transactions"]) == ["read:transactions"]
-    assert roles.strip_full_suffix([]) == []
+    # Agent: .full stripped + deduped
+    agent_attrs = roles.derive_token_attrs(
+        ["read:transactions", "read:transactions.full"], "agent"
+    )
+    assert agent_attrs["effective_scopes"] == ["read:transactions"]
+    assert agent_attrs["floor_stripped"] is True
+    # Agent: order-independent
+    agent_attrs2 = roles.derive_token_attrs(
+        ["read:transactions.full", "read:transactions"], "agent"
+    )
+    assert agent_attrs2["effective_scopes"] == ["read:transactions"]
+    # Agent: no .full, no change
+    assert roles.derive_token_attrs(["read:transactions"], "agent")["effective_scopes"] == ["read:transactions"]
+    # Agent: empty
+    assert roles.derive_token_attrs([], "agent")["effective_scopes"] == []
+    # Human: .full KEPT
+    human_attrs = roles.derive_token_attrs(
+        ["read:transactions", "read:transactions.full"], "human"
+    )
+    assert human_attrs["effective_scopes"] == ["read:transactions", "read:transactions.full"]
+    assert human_attrs["floor_stripped"] is False
 
 
 # ----------------------------------------------------------------------------

@@ -1,7 +1,19 @@
-"""POST /oauth/token - all 4 grant types."""
+"""POST /oauth/token - all 4 grant types.
+
+After the Cedar migration: the gate decision (permit/deny) is made by Cedar
+via cedar_engine.decide(). Python still does:
+  - Authentication (client_secret, PKCE, refresh-token validity)
+  - Subject-token verification (RFC 8693)
+  - Computing effective scopes (set intersection) -- the inputs Cedar
+    evaluates against
+  - Computing JWT claim values via derive_token_attrs (umask, .full stripping)
+"""
 import base64
 import binascii
+import json
+import logging
 import time
+import uuid
 from datetime import datetime, timezone
 from fastapi import APIRouter, Form, HTTPException, Request
 
@@ -12,6 +24,7 @@ from ..jwt_utils import (
     verify_pkce,
 )
 from ..services import agents, audit, clients, roles
+from ..services.cedar_engine import get_engine
 from ..services.codes import (
     consume_code,
     consume_refresh,
@@ -20,6 +33,51 @@ from ..services.codes import (
 )
 
 router = APIRouter()
+log = logging.getLogger("control-plane.token")
+
+
+def _cedar_authorize(
+    *,
+    grant_type: str,
+    principal_type: str,        # "User" or "Agent"
+    principal_id: str,
+    requested_scopes: list[str],
+    subject_scopes: list[str] | None = None,
+    client_type: str = "user_app",
+) -> None:
+    """Run Cedar gate decision. Raises HTTPException(400, invalid_scope) on deny.
+
+    Builds a per-request TokenRequest entity and evaluates against the loaded
+    PolicySet + base Entities. On engine errors we fail-closed (deny) --
+    safer than fail-open for an authorization gate.
+    """
+    jti = str(uuid.uuid4())
+    token_req = {
+        "uid": {"type": "TokenRequest", "id": jti},
+        "attrs": {
+            "grant_type": grant_type,
+            "requested_scopes": list(requested_scopes or []),
+            "subject_scopes": list(subject_scopes or []),
+            "client_type": client_type,
+        },
+        "parents": [],
+    }
+    try:
+        result = get_engine().decide(
+            action="IssueToken",
+            principal_uid={"type": principal_type, "id": principal_id},
+            resource_uid={"type": "TokenRequest", "id": jti},
+            extra_entities_json=json.dumps([token_req]),
+        )
+    except Exception as e:
+        log.error(f"cedar_authorize: engine error, failing closed: {e}")
+        raise HTTPException(status_code=400, detail={"error": "invalid_scope",
+                                                     "error_description": "policy engine unavailable"})
+    if not result.allowed:
+        errors = "; ".join(result.diagnostics.errors or ["policy denies"])
+        log.info(f"cedar_authorize: DENY grant_type={grant_type} principal={principal_id} requested={requested_scopes} subject={subject_scopes} errors={errors}")
+        raise HTTPException(status_code=400, detail={"error": "invalid_scope",
+                                                     "error_description": errors})
 
 
 def _client_credentials_from_request(request: Request, form_client_id: str | None, form_client_secret: str | None) -> tuple[str, str]:
@@ -93,20 +151,30 @@ async def _grant_authorization_code(client, code, code_verifier, redirect_uri):
     user_role = get_user_role(ac.user_id)
     if user_role is None:
         raise HTTPException(status_code=400, detail={"error": "invalid_grant", "error_description": "user has no role"})
-    effective = roles.compute_effective_scopes(user_role, ac.scope)
 
-    if not effective:
-        raise HTTPException(status_code=400, detail={"error": "invalid_scope"})
+    # Cedar gate: scope authorization for this human principal.
+    _cedar_authorize(
+        grant_type="authorization_code",
+        principal_type="User",
+        principal_id=ac.user_id,
+        requested_scopes=ac.scope or [],
+        client_type=client["client_type"],
+    )
 
-    scope_str = " ".join(effective)
-    # Humans are allowed to keep .full scopes and receive raw umask clearance.
-    umask = roles.compute_umask(effective, is_agent=False)
-    access_token, jti = mint_jwt(
+    # After Cedar says yes: compute effective scopes + JWT claim values.
+    effective = roles.compute_effective_scopes_local(user_role, ac.scope)
+    attrs = roles.derive_token_attrs(effective, requested_principal_type="human")
+    scope_str = " ".join(attrs["effective_scopes"])
+    umask = attrs["umask"]
+    jti = str(uuid.uuid4())
+
+    access_token, _ = mint_jwt(
         sub=ac.user_id,
         scope=scope_str,
         client_id=client["client_id"],
         exp_seconds=config.JWT_TTL_SECONDS,
         umask=umask,
+        jti=jti,
     )
     exp_dt = datetime.fromtimestamp(int(time.time()) + config.JWT_TTL_SECONDS, tz=timezone.utc)
     audit.record_token(jti, ac.user_id, None, client["client_id"], scope_str, exp_dt)
@@ -117,7 +185,7 @@ async def _grant_authorization_code(client, code, code_verifier, redirect_uri):
         result="success",
         details={"grant_type": "authorization_code", "role": user_role, "scope": scope_str, "umask": umask},
     )
-    refresh = create_refresh(ac.user_id, client["client_id"], effective, jti, config.REFRESH_TTL_SECONDS)
+    refresh = create_refresh(ac.user_id, client["client_id"], attrs["effective_scopes"], jti, config.REFRESH_TTL_SECONDS)
     return {
         "access_token": access_token,
         "token_type": "Bearer",
@@ -140,15 +208,28 @@ async def _grant_refresh_token(client, refresh_token):
     user_role = get_user_role(rt.user_id)
     if user_role is None:
         raise HTTPException(status_code=400, detail={"error": "invalid_grant", "error_description": "user has no role"})
-    effective = roles.compute_effective_scopes(user_role, rt.scope)
-    scope_str = " ".join(effective)
-    umask = roles.compute_umask(effective, is_agent=False)
-    access_token, jti = mint_jwt(
+
+    _cedar_authorize(
+        grant_type="refresh_token",
+        principal_type="User",
+        principal_id=rt.user_id,
+        requested_scopes=rt.scope or [],
+        client_type=client["client_type"],
+    )
+
+    effective = roles.compute_effective_scopes_local(user_role, rt.scope)
+    attrs = roles.derive_token_attrs(effective, requested_principal_type="human")
+    scope_str = " ".join(attrs["effective_scopes"])
+    umask = attrs["umask"]
+    jti = str(uuid.uuid4())
+
+    access_token, _ = mint_jwt(
         sub=rt.user_id,
         scope=scope_str,
         client_id=client["client_id"],
         exp_seconds=config.JWT_TTL_SECONDS,
         umask=umask,
+        jti=jti,
     )
     exp_dt = datetime.fromtimestamp(int(time.time()) + config.JWT_TTL_SECONDS, tz=timezone.utc)
     audit.record_token(jti, rt.user_id, None, client["client_id"], scope_str, exp_dt)
@@ -159,7 +240,7 @@ async def _grant_refresh_token(client, refresh_token):
         result="success",
         details={"scope": scope_str, "role": user_role, "umask": umask},
     )
-    new_refresh = create_refresh(rt.user_id, client["client_id"], effective, jti, config.REFRESH_TTL_SECONDS)
+    new_refresh = create_refresh(rt.user_id, client["client_id"], attrs["effective_scopes"], jti, config.REFRESH_TTL_SECONDS)
     return {
         "access_token": access_token,
         "token_type": "Bearer",
@@ -193,28 +274,32 @@ async def _grant_token_exchange(client, subject_token, subject_token_type, audie
     if not agent["is_delegatable"]:
         raise HTTPException(status_code=400, detail={"error": "invalid_request", "error_description": f"agent {agent_id} is not delegatable"})
 
-    # Compute effective = subject_scopes ∩ agent.default_scopes
     subject_scopes = set(subject_claims.get("scope", "").split())
-    agent_scopes = set(agent["default_scopes"])
-    raw_effective = sorted(subject_scopes & agent_scopes)
-    if not raw_effective:
-        raise HTTPException(status_code=400, detail={"error": "invalid_scope"})
-    # Principal-type floor: agents never receive `.full` clearance. Strip the
-    # suffix from any scope in the effective set before exposing it in the
-    # `scope` claim (keeps the claim honest about what the agent can do).
-    effective = roles.strip_full_suffix(raw_effective)
-    scope_str = " ".join(effective)
-    # Even though the agent's `scope` claim no longer has `.full`, compute_umask
-    # ALSO enforces `is_agent -> masked`. Belt-and-suspenders.
-    umask = roles.compute_umask(raw_effective, is_agent=True)
+    # Cedar gate: agent delegation + scope intersection.
+    _cedar_authorize(
+        grant_type="token_exchange",
+        principal_type="Agent",
+        principal_id=agent_id,
+        requested_scopes=[],
+        subject_scopes=list(subject_scopes),
+        client_type=client["client_type"],
+    )
 
-    access_token, jti = mint_jwt(
+    # After Cedar says yes: compute effective scopes + JWT claim values.
+    raw_effective = sorted(subject_scopes & set(agent["default_scopes"]))
+    attrs = roles.derive_token_attrs(raw_effective, requested_principal_type="agent")
+    scope_str = " ".join(attrs["effective_scopes"])
+    umask = attrs["umask"]
+    jti = str(uuid.uuid4())
+
+    access_token, _ = mint_jwt(
         sub=subject_claims["sub"],
         scope=scope_str,
         client_id=client["client_id"],
         exp_seconds=config.JWT_TTL_SECONDS,
         act={"sub": agent_id},
         umask=umask,
+        jti=jti,
     )
     exp_dt = datetime.fromtimestamp(int(time.time()) + config.JWT_TTL_SECONDS, tz=timezone.utc)
     audit.record_token(jti, subject_claims["sub"], agent_id, client["client_id"], scope_str, exp_dt)
@@ -230,7 +315,7 @@ async def _grant_token_exchange(client, subject_token, subject_token_type, audie
             "raw_intersection_scope": " ".join(raw_effective),
             "subject_scope": " ".join(sorted(subject_scopes)),
             "umask": umask,
-            "floor_applied": raw_effective != effective,
+            "floor_applied": attrs["floor_stripped"],
         },
     )
     return {
@@ -253,21 +338,31 @@ async def _grant_client_credentials(client, scope):
         raise HTTPException(status_code=400, detail={"error": "invalid_client"})
 
     requested = [s for s in (scope or "").split() if s]
+
+    # Cedar gate: client_credentials for this headless agent.
+    _cedar_authorize(
+        grant_type="client_credentials",
+        principal_type="Agent",
+        principal_id=agent_id,
+        requested_scopes=requested,
+        client_type=client["client_type"],
+    )
+
+    # After Cedar says yes: compute effective scopes + JWT claim values.
     allowed = set(client["allowed_scopes"])
     raw_effective = [s for s in requested if s in allowed] if requested else list(allowed)
-    if not raw_effective:
-        raise HTTPException(status_code=400, detail={"error": "invalid_scope"})
-    # Principal-type floor: headless agents never receive `.full` clearance.
-    effective = roles.strip_full_suffix(raw_effective)
-    scope_str = " ".join(effective)
-    umask = roles.compute_umask(raw_effective, is_agent=True)
+    attrs = roles.derive_token_attrs(raw_effective, requested_principal_type="agent")
+    scope_str = " ".join(attrs["effective_scopes"])
+    umask = attrs["umask"]
+    jti = str(uuid.uuid4())
 
-    access_token, jti = mint_jwt(
+    access_token, _ = mint_jwt(
         sub=agent_id,
         scope=scope_str,
         client_id=client["client_id"],
         exp_seconds=config.JWT_TTL_SECONDS,
         umask=umask,
+        jti=jti,
     )
     exp_dt = datetime.fromtimestamp(int(time.time()) + config.JWT_TTL_SECONDS, tz=timezone.utc)
     audit.record_token(jti, agent_id, None, client["client_id"], scope_str, exp_dt)
@@ -282,7 +377,7 @@ async def _grant_client_credentials(client, scope):
             "scope": scope_str,
             "raw_intersection_scope": " ".join(raw_effective),
             "umask": umask,
-            "floor_applied": raw_effective != effective,
+            "floor_applied": attrs["floor_stripped"],
         },
     )
     return {

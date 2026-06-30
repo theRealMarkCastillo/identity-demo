@@ -406,7 +406,7 @@ Vendor's agent → your API:  Bearer <token>
 **What you'd build.**
 
 - **Token issuance.** The broker is the AS. Tools that talk to the broker are OAuth 2.1 clients. Tools that *don't* (because you can't modify them) can be configured with bearer tokens issued by the broker, scoped per-user-per-agent-per-tool.
-- **Policy engine.** OPA, Cedar, or your own — the broker evaluates "should this agent be allowed to do X for this user on this resource?" before issuing the token. Policies are user-readable and version-controlled.
+- **Policy engine.** Cedar (as demonstrated in this repo), OPA, or your own — the broker evaluates "should this agent be allowed to do X for this user on this resource?" before issuing the token. See `control-plane/policies/*.cedar` and `control-plane/app/services/cedar_engine.py` for the implementation pattern. Policies are stored in a DB table (`platform.cedar_policies`) and editable via UI with inline validation and preview.
 - **Audit fan-out.** Every grant, every action, every revoke is logged centrally and exportable to the user's SIEM.
 - **Resource adapters.** The broker needs to enforce at the resource. If the resource is the user's Postgres DB, the broker issues an RLS-bypass credential and a delegated agent credential, both with their own scope; the user runs a small adapter (`pgaudit`, `pg_tokenizer`) in their DB that verifies and applies the GUCs. If the resource is SaaS-X without an API for delegation, the broker is limited to issuing scoped-to-SaaS-X-API tokens and trusting SaaS-X's own enforcement.
 - **Cost & rate-limit layer.** The broker is the natural place to track per-agent spend and enforce per-agent limits; "agent_Y can spend $20/day on this user's behalf."

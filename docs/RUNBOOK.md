@@ -243,7 +243,7 @@ This demo reinforces the principal-type floor with visible "evidence":
 
 ### Wrap-up (30s)
 
-> "Three principals, three OAuth flows, one RLS policy engine. Every action is cryptographically attributable. Try to break it — the data layer is the last line of defense."
+> "Three principals, three OAuth flows, one Cedar policy engine + RLS as the last line of defense. Every action is cryptographically attributable. Try to break it — the data layer is the last line of defense."
 
 ### If time is short (5-minute cut)
 
@@ -267,7 +267,9 @@ If you want to understand how each piece is built, the files below are the entry
 | How the control plane issues tokens | `control-plane/app/routes/token.py` | All 4 grant types (`authorization_code`, `refresh_token`, token-exchange, `client_credentials`) in one file. ~250 lines, well-commented. Each grants the `umask` claim and enforces the principal-type floor on agent paths. |
 | How the control plane enforces OAuth 2.1 | `control-plane/app/routes/authorize.py` | Rejects anything other than PKCE/S256 — this is what makes the demo OAuth 2.1-compliant, not just OAuth 2.0-flavored. |
 | How token exchange actually works | `control-plane/app/routes/token.py` (`_grant_token_exchange`) | See the `effective = sorted(subject_scopes & agent_scopes)` computation, the `act` claim being set, and the principal-type floor (`strip_full_suffix` + `compute_umask`). |
-| How umask is computed and enforced | `control-plane/app/services/roles.py` | `compute_umask(scopes, is_agent)` and `strip_full_suffix(scopes)` — the principal-type floor in ~20 lines. |
+| How umask is computed and enforced | `control-plane/app/services/roles.py` | `derive_token_attrs(scopes, type)` — the principal-type floor (+ `.full` stripping) in ~30 lines. Note: the permit/deny gate is in Cedar (`token_issuance.cedar`); this computes the JWT claim values after Cedar says yes. |
+| How Cedar policies gate token issuance | `control-plane/policies/token_issuance.cedar` + `control-plane/app/services/cedar_engine.py` | 3 permit rules: humans, delegated agents, headless agents. `cedar_engine.decide()` runs them against TokenRequest entities at each `/oauth/token` call. |
+| How to manage Cedar policies | `/policies` UI page (after login) | Full CRUD, inline syntax validation, preview sandbox that evaluates draft policies against test inputs. Backed by `platform.cedar_policies` table + control-plane reload on every save. |
 | How the web app verifies a token | `web-app/app/jwt_verify.py` | JWKS cache, signature verification, `iss` / `aud` / `exp` checks. |
 | How the web app propagates identity to the DB | `web-app/app/db.py` | The `run_with_identity()` helper — see how `SET LOCAL app.user_id, app.actor_id, app.unmask_level` is called per-transaction. |
 | How an LLM tool call ends up in RLS + masking | `web-app/app/tools.py` | Read tools query `target.transactions_masked`; write tools hit the base table directly. The DB enforces the rest. |
@@ -280,7 +282,7 @@ If you want to understand how each piece is built, the files below are the entry
 **The most rewarding 5-minute deep dive:**
 
 1. Open `db/init.sql` — find `CREATE POLICY select_policy ON target.transactions`. Read the three branches (human / delegated / headless). Notice how each branch inspects `current_actor_id()` and `current_user_id()`. Then scroll to `apply_mask()` and the `target.transactions_masked` view — cell-level masking layered on top.
-2. Open `control-plane/app/routes/token.py` — find `_grant_token_exchange`. See the line `effective = sorted(subject_scopes & agent_scopes)`. Just below, the principal-type floor (`strip_full_suffix` + `compute_umask`) hardens the scope claim and the `umask` claim.
+2. Open `control-plane/policies/token_issuance.cedar` — see the 3 permit rules that gate token issuance. Then open `control-plane/app/routes/token.py` — find `_cedar_authorize`. See how each grant handler calls Cedar first, then `derive_token_attrs` for the JWT claims.
 3. Trigger an RLS block (Demo 2 step 3). Then run:
    ```sql
    SELECT ts, event_type, sub, act_sub, details
@@ -315,6 +317,8 @@ Browse to **`http://localhost:13000/admin`** after logging in. The dashboard sho
 - **Admin history** — recent `admin_*` rows from `platform.audit_log` (every cli-admin write)
 
 This page is **strictly read-only**. It uses the web app's existing `app_session` DB role, which only has `SELECT` on `platform.roles/role_scopes/agents/clients/column_policies`. No CSRF tokens are issued because nothing is written.
+
+A separate **`/policies`** page provides full CRUD for Cedar policies (the service-level authorization rules for token issuance). Policies are stored in `platform.cedar_policies` and the control plane hot-reloads them on every save. The page includes inline Cedar syntax validation and a preview sandbox for testing draft policies against sample inputs.
 
 **Live updates.** The dashboard polls `/api/admin-data` every 10 seconds and re-renders each panel in place, so changes made via `cli-admin` in another terminal show up without a manual reload. The header has:
 - **`↻ Refresh now`** — immediate re-fetch
@@ -432,7 +436,7 @@ For audience questions:
 
 - **"Could the LLM just leak the user's JWT in its output?"** In principle, yes. That's why the demo's JWTs are short-lived (1h) and why revocation works mid-conversation (Demo 2c). In production you'd add output filtering, scope the token to a specific audience, and consider DPoP (RFC 9449) so a stolen token can't be replayed from a different machine.
 
-- **"What stops the agent from seeing raw PII?"** Three independent checks: (1) the control plane's `strip_full_suffix()` removes `.full` from the agent's effective scope claim, so the claim honestly says what the bearer can do; (2) `compute_umask(..., is_agent=True)` always returns `'masked'`; (3) the database's `apply_mask()` only returns raw when `app.unmask_level='raw'`, and that GUC is only ever set when the JWT says so. Bypass one, two more wait.
+- **"What stops the agent from seeing raw PII?"** Three independent checks: (1) Cedar gates the token issuance — only scopes the agent is permitted to request are allowed; (2) `derive_token_attrs(..., type='agent')` strips `.full` from the scope claim and forces `umask='masked'` regardless; (3) the database's `apply_mask()` only returns raw when `app.unmask_level='raw'`. Bypass one, two more wait.
 - **"Can I see what 'masked' looks like for a senior?"** Yes — log in as `user_123` (senior_analyst) and click **Masking: Side-by-Side Diff**. It runs the same query twice and renders a `raw → masked` table. Click **Copilot: Read Own** to see the always-masked view an agent would have of the same data. Three buttons, three angles on the same data.
 
 - **"Is `data_class: 'pii'` a JWT claim I'd add?"** No — a custom JWT claim gets messy across issuers. We chose scope suffix + internal `umask` claim instead, because scopes already have semantics (limits what an agent can do), they're standard OAuth, and the control plane is the single authority that interprets them. If you want it more declarative, you'd issue a `data_class` claim from your IDP and have the control plane translate it to `umask` — a layer cake. For most production systems, scopes are enough.
@@ -444,6 +448,7 @@ For audience questions:
 | Web App (dashboard) | http://localhost:13000 |
 | Web App — current principal | http://localhost:13000/api/principal (returns sub/role/scopes/umask) |
 | Web App — admin (read-only) | http://localhost:13000/admin (after login) |
+| Web App — Cedar policies | http://localhost:13000/policies (after login; manage token issuance policies) |
 | Web App — masking demo endpoints (curl/Postman; need CSRF + session cookie) | `POST /action/human-read`, `POST /action/masking-comparison`, `POST /action/copilot-{read,full,write}`, `POST /trigger-headless`, `POST /revoke/agent-token`, `POST /revoke/session` |
 | Control Plane health | http://localhost:18080/health |
 | Control Plane JWKS | http://localhost:18080/jwks.json |
