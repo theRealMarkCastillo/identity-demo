@@ -18,7 +18,7 @@ from psycopg.rows import dict_row
 
 from ..config import config
 from ..db import get_conn
-from ..session import create_csrf_token, load_session, verify_csrf
+from ..session import CSRF_COOKIE, create_csrf_token, load_session, verify_csrf
 
 router = APIRouter()
 templates = Jinja2Templates(directory="templates")
@@ -65,7 +65,7 @@ def policies_page(request: Request):
         {"request": request, "policies": policies, "csrf_token": csrf_token,
          "control_plane_url": config.CONTROL_PLANE_URL},
     )
-    response.set_cookie("csrf_token", csrf_token, max_age=8*3600, httponly=False, samesite="lax", path="/")
+    response.set_cookie(CSRF_COOKIE, csrf_token, max_age=8*3600, httponly=False, samesite="lax", path="/")
     return response
 
 

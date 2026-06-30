@@ -332,7 +332,12 @@ async function previewPolicy() {
   const {ok, data} = await api('/api/policies/preview', {method: 'POST', body: fd});
   if (!ok) {
     out.classList.add('deny');
-    out.textContent = `✗ Error: ${data.error || data.status}\n${(data.errors || []).join('\n')}`;
+    const msgs = [];
+    if (data?.detail) msgs.push(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail));
+    if (data?.error) msgs.push(data.error);
+    if (Array.isArray(data?.errors)) msgs.push(...data.errors);
+    if (msgs.length === 0) msgs.push(`HTTP ${data?.status || 'unknown'}`);
+    out.textContent = `✗ Error:\n${msgs.join('\n')}`;
     return;
   }
   if (!data.valid) {
