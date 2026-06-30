@@ -143,6 +143,10 @@ class CedarEngine:
         Used by the UI's 'Preview' sandbox to test a draft policy against
         sample entities + a sample request without persisting anything.
 
+        Merges the caller-provided entities with the engine's base entities
+        (User + Agent loaded from the DB), so preview can reference real
+        users/agents without forcing the UI to ship their attributes.
+
         Returns {valid, allowed, errors, reasons, diagnostics}.
         """
         try:
@@ -155,7 +159,7 @@ class CedarEngine:
                 "reasons": [],
             }
         try:
-            entities = cedarpy.Entities.from_json_str(entities_json)
+            caller_entities = cedarpy.Entities.from_json_str(entities_json) if entities_json else cedarpy.Entities.from_json_str("[]")
         except (ValueError, json.JSONDecodeError) as e:
             return {
                 "valid": True,
@@ -164,6 +168,12 @@ class CedarEngine:
                 "errors": [f"entities parse failed: {e}"],
                 "reasons": [],
             }
+        # Merge: base entities (Users + Agents from DB) + caller-provided
+        # entities. Caller entities override base entities on uid collision.
+        if self._base_entities is not None:
+            entities = self._base_entities.with_added_json_str(entities_json)
+        else:
+            entities = caller_entities
         result = cedarpy.is_authorized(request, ps, entities)
         return {
             "valid": True,

@@ -143,16 +143,45 @@ def api_preview_policy(
     action: str = Form(...),
     resource: str = Form(...),
 ):
-    """Dry-run a policy with sample request. Proxies to control-plane."""
+    """Dry-run a policy with sample request. Proxies to control-plane.
+
+    Cedar needs the principal and resource to exist in entities_json (or in
+    the base entity set). The control plane's base set contains real User
+    and Agent entities, but the preview sandbox uses synthetic IDs (e.g.,
+    "user_123" is real, but "preview-1" isn't). So we append any
+    principal/resource entities that aren't pre-loaded to entities_json
+    before forwarding.
+    """
     verify_csrf(request, csrf_token)
     try:
         principal_dict = json.loads(principal)
         resource_dict = json.loads(resource)
+        # Build a merged entities list: caller-provided + auto-built from
+        # principal/resource (so the policy can resolve them).
+        try:
+            base_entities = json.loads(entities_json) if entities_json else []
+        except json.JSONDecodeError:
+            base_entities = []
+        if not isinstance(base_entities, list):
+            base_entities = []
+        # Cedar base set has User + Agent entities. TokenRequest and other
+        # synthetic types must be added explicitly per request.
+        synthetic_types = {"TokenRequest", "Resource"}
+        extra = []
+        for src in (principal_dict, resource_dict):
+            t = src.get("type")
+            if t in synthetic_types:
+                # Avoid duplicates if same uid already in entities_json
+                if not any(e.get("uid") == {"type": t, "id": src.get("id")} for e in base_entities):
+                    extra.append({"uid": {"type": t, "id": src.get("id")},
+                                  "attrs": src.get("attrs", {}),
+                                  "parents": []})
+        merged = base_entities + extra
         r = httpx.post(
             _cp_url("/admin/policies/preview"),
             json={
                 "policy_text": policy_text,
-                "entities_json": entities_json,
+                "entities_json": json.dumps(merged),
                 "request": {
                     "principal": principal_dict,
                     "action": {"type": "Action", "id": action},
@@ -246,4 +275,22 @@ def api_delete_policy(
         return JSONResponse(r.json(), status_code=r.status_code)
     except httpx.HTTPError as e:
         log.exception("delete: control-plane unreachable")
+        raise HTTPException(503, f"control-plane unreachable: {e}")
+
+
+@router.post("/api/policies/reload")
+def api_reload_policies(request: Request):
+    """Reload the control-plane's Cedar engine (policies + entities from DB).
+
+    Routed through the web-app to avoid CORS — the browser would otherwise
+    fetch directly to the control-plane's `:8080` (different origin) and
+    the request would be blocked.
+    """
+    if not _require_login(request):
+        raise HTTPException(401, "not logged in")
+    try:
+        r = httpx.post(_cp_url("/admin/policies/reload"), timeout=10.0)
+        return JSONResponse(r.json(), status_code=r.status_code)
+    except httpx.HTTPError as e:
+        log.exception("reload: control-plane unreachable")
         raise HTTPException(503, f"control-plane unreachable: {e}")

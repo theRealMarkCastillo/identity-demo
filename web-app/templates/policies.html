@@ -197,7 +197,11 @@ function clearEditorStatus() {
 
 function showEditorErrors(errors) {
   const el = document.getElementById('editor-errors');
-  el.textContent = Array.isArray(errors) ? errors.join('\n') : String(errors);
+  if (Array.isArray(errors)) {
+    el.textContent = errors.filter(Boolean).join('\n') || 'unknown error';
+  } else {
+    el.textContent = String(errors);
+  }
   el.style.display = 'block';
   document.getElementById('editor-success').style.display = 'none';
 }
@@ -244,7 +248,12 @@ async function validatePolicy() {
   if (ok && data.valid) {
     showEditorSuccess(`✓ Valid — ${data.policy_count} polic${data.policy_count === 1 ? 'y' : 'ies'} parsed`);
   } else {
-    showEditorErrors(data.errors || ['unknown error']);
+    // Validate endpoint returns {valid, errors, policy_count}. On proxy error
+    // (CSRF, etc.), the body is FastAPI's {detail: "..."}.
+    const msgs = []
+      .concat(data?.errors || [])
+      .concat(data?.detail ? [typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail)] : []);
+    showEditorErrors(msgs.length ? msgs : ['unknown error']);
   }
 }
 
@@ -266,7 +275,15 @@ async function savePolicy() {
     showEditorSuccess(`✓ Saved — engine reloaded`);
     setTimeout(() => location.reload(), 800);
   } else {
-    showEditorErrors([data.error || `HTTP ${data.status}`, ...(data.errors || [])]);
+    // The web-app proxy returns FastAPI-style {detail: "..."} for HTTPException
+    // and the control-plane returns {error: "...", errors: [...]} for policy
+    // errors. Handle both shapes.
+    const msgs = [];
+    if (data?.detail) msgs.push(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail));
+    if (data?.error) msgs.push(data.error);
+    if (Array.isArray(data?.errors)) msgs.push(...data.errors);
+    if (msgs.length === 0) msgs.push(`HTTP ${data?.status || 'unknown'}`);
+    showEditorErrors(msgs);
   }
 }
 
@@ -279,23 +296,24 @@ async function deletePolicy(policyId) {
   if (ok) {
     setTimeout(() => location.reload(), 400);
   } else {
-    alert(`Delete failed: ${data.error || data.status}`);
+    const msg = data?.detail || data?.error || `HTTP ${data?.status}`;
+    alert(`Delete failed: ${msg}`);
   }
 }
 
 async function reloadEngine() {
-  // Use the control-plane's reload endpoint via a synthetic HTTP call.
-  // Since we don't expose it through the web-app proxy yet, this just hits it directly.
+  // Route through the web-app's /api/policies/reload proxy to avoid CORS
+  // (browser can't fetch cross-origin to the control-plane directly).
   try {
-    const r = await fetch(`${CP_URL}/admin/policies/reload`, {method: 'POST'});
+    const r = await fetch('/api/policies/reload', {method: 'POST', credentials: 'same-origin'});
     if (r.ok) {
       document.getElementById('list-status').textContent = '✓ engine reloaded';
       setTimeout(refreshEngineStatus, 500);
     } else {
-      document.getElementById('list-status').textContent = `✗ reload failed: ${r.status}`;
+      document.getElementById('list-status').textContent = `✗ reload failed: HTTP ${r.status}`;
     }
   } catch (e) {
-    document.getElementById('list-status').textContent = `✗ control-plane unreachable`;
+    document.getElementById('list-status').textContent = `✗ ${e}`;
   }
 }
 
@@ -329,7 +347,8 @@ async function previewPolicy() {
 
 async function refreshEngineStatus() {
   try {
-    const r = await fetch(`${CP_URL}/admin/policies/reload`, {method: 'POST'});
+    const r = await fetch('/api/policies/reload', {method: 'POST', credentials: 'same-origin'});
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
     document.getElementById('engine-status').textContent =
       `control-plane: ${CP_URL}\nlast reload: ${JSON.stringify(data)}`;
