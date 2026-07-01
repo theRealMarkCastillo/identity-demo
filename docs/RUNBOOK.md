@@ -126,7 +126,7 @@ psql -h localhost -p 54321 -U app_session -d identity -c \
 # (set app.user_id, app.actor_id, app.unmask_level first if you want to test specific paths)
 ```
 
-If the web-app container was rebuilt recently, the dashboard should already show **8 demo buttons** under "One-Click Demos": Human: Read Own, Human: Update Row, Copilot: Read Own, Copilot: Full Clearance Attempt, Copilot: Try Update, Masking: Side-by-Side Diff, plus Headless.
+If the web-app container was rebuilt recently, the dashboard should already show **7 demo buttons** under "One-Click Demos": Human: Read Own, Human: Update Row, Copilot: Read Own, Copilot: Full Clearance Attempt, Copilot: Try Update, Masking: Side-by-Side Diff, plus Headless.
 
 ### Demo 1: Human Direct (1 min)
 
@@ -156,7 +156,7 @@ If the web-app container was rebuilt recently, the dashboard should already show
 6. **Optional**: Click **Masking: Side-by-Side Diff** here as well. The endpoint correctly returns `result: skipped` with a message explaining that junior isn't entitled to raw clearance. This proves the role-gate — it's not a cosmetic security.
    > "The comparison endpoint is senior-only on purpose. We won't force `app.unmask_level='raw'` on behalf of someone who isn't entitled to raw."
 
-> **If asked "could the web app just ignore the scope?"** → "Yes, the web app *could* — but it doesn't get to. The web app receives the token, extracts the scope, and passes it to the tool layer. The tool calls `run_with_identity(sub, scope, umask)` which uses the **token's** scope and **token's** umask, not anything the web app invents. And RLS enforces it independently — the web app can't bypass the database."
+> **If asked "could the web app just ignore the scope?"** → "Yes, the web app *could* — but it doesn't get to. The web app receives the token, extracts `sub`/`act.sub`/`umask` from the **verified** claims, and passes them to `run_with_identity(user_id, actor_id, umask)`. Scope itself isn't a `run_with_identity` argument — it's the token's `umask` and identity claims that reach the database, and RLS enforces it independently — the web app can't bypass the database."
 
 ### Demo 1c: Redaction, One-Click (30s)
 
@@ -197,7 +197,7 @@ This demo reinforces the principal-type floor with visible "evidence":
 4. The PII columns in the response are **still masked** — same `***`, last-4, hash.
    > "You tried to grant full clearance to the agent. The control plane honored your explicit scope request, then stripped `.full` out of the agent's effective scope claim, and forced umask to masked. Three independent layers, all saying no. An agent that wants to see raw PII has to escalate at a layer none of these can hide from: the audit log."
 
-> **If asked "what is the principal-type floor?"** → "It's the rule that any token minted for a non-human principal (`act` claim present, or `client_credentials`) gets `umask: masked` regardless of which scopes are in its effective set. Implemented in `control-plane/app/services/roles.py:compute_umask` and reinforced by `apply_mask` reading `app.unmask_level` at the database. See ARCHITECTURE.md §6.5."
+> **If asked "what is the principal-type floor?"** → "It's the rule that any token minted for a non-human principal (`act` claim present, or `client_credentials`) gets `umask: masked` regardless of which scopes are in its effective set. Implemented in `control-plane/app/services/roles.py:derive_token_attrs` and reinforced by `apply_mask` reading `app.unmask_level` at the database. See ARCHITECTURE.md §6.5."
 
 ### Demo 2b: LLM Tool-Calling — The Real Show (2 min)
 
@@ -257,7 +257,7 @@ Everything else can be covered in Q&A. If the masking story specifically comes u
 
 ## 6. Where to Dig Deeper After the Demo
 
-**Verification first:** run `make test` after `make up` — the suite covers 35+ scenarios across all three principal types (RLS + masking) and is the fastest way to confirm your install is wired up correctly. See `tests/`.
+**Verification first:** run `make test` after `make up` — the suite covers 55 tests across all three principal types (RLS + masking) and is the fastest way to confirm your install is wired up correctly. See `tests/`.
 
 If you want to understand how each piece is built, the files below are the entry points. Read in this order if you're new to the codebase:
 
@@ -266,7 +266,7 @@ If you want to understand how each piece is built, the files below are the entry
 | How the database enforces identity | `db/init.sql` | RLS policies, role mapping, seed data, `app_session` role, **and the column-level masking engine** (`apply_mask()` + `target.transactions_masked`) all live here. This is the **last line of defense**. |
 | How the control plane issues tokens | `control-plane/app/routes/token.py` | All 4 grant types (`authorization_code`, `refresh_token`, token-exchange, `client_credentials`) in one file. ~250 lines, well-commented. Each grants the `umask` claim and enforces the principal-type floor on agent paths. |
 | How the control plane enforces OAuth 2.1 | `control-plane/app/routes/authorize.py` | Rejects anything other than PKCE/S256 — this is what makes the demo OAuth 2.1-compliant, not just OAuth 2.0-flavored. |
-| How token exchange actually works | `control-plane/app/routes/token.py` (`_grant_token_exchange`) | See the `effective = sorted(subject_scopes & agent_scopes)` computation, the `act` claim being set, and the principal-type floor (`strip_full_suffix` + `compute_umask`). |
+| How token exchange actually works | `control-plane/app/routes/token.py` (`_grant_token_exchange`) | See the `effective = sorted(subject_scopes & agent_scopes)` computation, the `act` claim being set, and the principal-type floor (`roles.derive_token_attrs`). |
 | How umask is computed and enforced | `control-plane/app/services/roles.py` | `derive_token_attrs(scopes, type)` — the principal-type floor (+ `.full` stripping) in ~30 lines. Note: the permit/deny gate is in Cedar (`token_issuance.cedar`); this computes the JWT claim values after Cedar says yes. |
 | How Cedar policies gate token issuance | `control-plane/policies/token_issuance.cedar` + `control-plane/app/services/cedar_engine.py` | 3 permit rules: humans, delegated agents, headless agents. `cedar_engine.decide()` runs them against TokenRequest entities at each `/oauth/token` call. |
 | How to manage Cedar policies | `/policies` UI page (after login) | Full CRUD, inline syntax validation, preview sandbox that evaluates draft policies against test inputs. Backed by `platform.cedar_policies` table + control-plane reload on every save. |

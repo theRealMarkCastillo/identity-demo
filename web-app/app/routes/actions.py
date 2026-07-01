@@ -60,6 +60,20 @@ def _umask_from_claims(claims: dict) -> str:
     return claims.get("umask") or "masked"
 
 
+def _verify_or_401(token: str) -> dict:
+    """Verify a JWT (signature, iss, aud, exp, revocation) or raise 401.
+
+    Every claim that ends up driving `run_with_identity()` — and therefore
+    RLS — must come through here, not `decode_unverified()`. Using an
+    unverified decode on the enforcement path would let a tampered, expired,
+    or revoked token still set the DB's identity GUCs.
+    """
+    try:
+        return jwt_verify.verify_token(token)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"invalid or revoked token: {e}")
+
+
 def _cache_agent_token(sess: dict, agent_t: dict, requested_scopes: list[str]) -> None:
     """Store the agent token AND metadata so the dashboard's principal panel
     has something to show that's distinct across mints.
@@ -71,7 +85,7 @@ def _cache_agent_token(sess: dict, agent_t: dict, requested_scopes: list[str]) -
     asked for, before the floor stripped .full).
     """
     agent_jwt: str = agent_t["access_token"]
-    claims = jwt_verify.decode_unverified(agent_jwt)
+    claims = _verify_or_401(agent_jwt)
     sess["agent_token"] = agent_jwt
     sess["agent_token_meta"] = {
         "jti_short": (claims.get("jti") or "")[:8],
@@ -90,7 +104,7 @@ def _cache_agent_token(sess: dict, agent_t: dict, requested_scopes: list[str]) -
 def action_human_write(request: Request, csrf_token: str = Form(...)):
     verify_csrf(request, csrf_token)
     sess = _require_session(request)
-    claims = jwt_verify.verify_token(sess["tokens"]["access_token"])
+    claims = _verify_or_401(sess["tokens"]["access_token"])
     umask = _umask_from_claims(claims)
 
     with run_with_identity(user_id=claims["sub"], actor_id=None, umask=umask) as conn:
@@ -111,7 +125,7 @@ def action_human_read(request: Request, csrf_token: str = Form(...)):
     """
     verify_csrf(request, csrf_token)
     sess = _require_session(request)
-    claims = jwt_verify.verify_token(sess["tokens"]["access_token"])
+    claims = _verify_or_401(sess["tokens"]["access_token"])
     umask = _umask_from_claims(claims)
 
     with run_with_identity(user_id=claims["sub"], actor_id=None, umask=umask) as conn:
@@ -146,7 +160,7 @@ def action_masking_comparison(request: Request, csrf_token: str = Form(...)):
     verify_csrf(request, csrf_token)
     sess = _require_session(request)
     human_jwt = sess["tokens"]["access_token"]
-    claims = jwt_verify.verify_token(human_jwt)
+    claims = _verify_or_401(human_jwt)
     sub = claims["sub"]
 
     role = None
@@ -235,7 +249,7 @@ def action_copilot_read(request: Request, csrf_token: str = Form(...)):
     _cache_agent_token(sess, agent_t, requested_scopes=["read:transactions"])
 
     agent_jwt = sess["agent_token"]
-    agent_claims = jwt_verify.decode_unverified(agent_jwt)
+    agent_claims = _verify_or_401(agent_jwt)
 
     umask = _umask_from_claims(agent_claims)
     with run_with_identity(user_id=agent_claims["sub"], actor_id=agent_claims["act"]["sub"], umask=umask) as conn:
@@ -279,11 +293,11 @@ def action_copilot_full(request: Request, csrf_token: str = Form(...)):
         requested_scopes=["read:transactions", "read:transactions.full"],
     )
     agent_jwt = sess["agent_token"]
-    agent_claims = jwt_verify.decode_unverified(agent_jwt)
+    agent_claims = _verify_or_401(agent_jwt)
 
     # Read the SUBJECT token's umask too — that's what the human would see if
     # they issued the same query themselves. Contrast with the agent's umask.
-    subject_claims = jwt_verify.decode_unverified(human_jwt)
+    subject_claims = _verify_or_401(human_jwt)
     human_umask = _umask_from_claims(subject_claims)
     agent_umask = _umask_from_claims(agent_claims)
 
@@ -327,13 +341,13 @@ def action_copilot_write(request: Request, csrf_token: str = Form(...)):
         agent_t = oauth_client.exchange_for_agent_token(human_jwt, "agent_copilot_99")
         sess["agent_token"] = agent_t["access_token"]
 
-    agent_claims = jwt_verify.decode_unverified(sess["agent_token"])
+    agent_claims = _verify_or_401(sess["agent_token"])
     umask = _umask_from_claims(agent_claims)
 
     with run_with_identity(user_id=agent_claims["sub"], actor_id=agent_claims["act"]["sub"], umask=umask) as conn:
         outcome = call_tool("update_transaction", conn, {"id": 1, "amount": 1.00})
 
-    return JSONResponse({
+    response = JSONResponse({
         "action": "copilot_write",
         "agent_claims": {
             "sub": agent_claims.get("sub"),
@@ -343,6 +357,8 @@ def action_copilot_write(request: Request, csrf_token: str = Form(...)):
         },
         "outcome": outcome,
     })
+    _set_session_cookie(response, sess)
+    return response
 
 
 # ----------------------------------------------------------------------------
@@ -355,7 +371,7 @@ def trigger_headless(request: Request, csrf_token: str = Form(...)):
     # Get a headless token via client credentials
     headless_t = oauth_client.get_client_credentials_token_for_headless()
     headless_jwt = headless_t["access_token"]
-    headless_claims = jwt_verify.decode_unverified(headless_jwt)
+    headless_claims = _verify_or_401(headless_jwt)
 
     # Cache the raw JWT in the session so the dashboard can render it without
     # re-minting. (Each click would otherwise create a new token, which is
@@ -397,7 +413,7 @@ def chat_copilot(request: Request, message: str = Form(...), csrf_token: str = F
             agent_t = oauth_client.exchange_for_agent_token(human_jwt, "agent_copilot_99")
             _cache_agent_token(sess, agent_t, requested_scopes=["read:transactions"])
 
-        agent_claims = jwt_verify.decode_unverified(sess["agent_token"])
+        agent_claims = _verify_or_401(sess["agent_token"])
         user_id = agent_claims["sub"]
         actor_id = agent_claims["act"]["sub"]
         umask = _umask_from_claims(agent_claims)

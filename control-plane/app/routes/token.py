@@ -252,6 +252,15 @@ async def _grant_refresh_token(client, refresh_token):
 
 
 async def _grant_token_exchange(client, subject_token, subject_token_type, audience, actor_token, actor_token_type):
+    # Only user-facing apps may request delegation. Without this gate, an
+    # agent client (which knows its own client_secret) could present a
+    # captured subject_token and an actor_token naming a DIFFERENT agent,
+    # minting itself a delegated token it was never meant to hold -- a
+    # confused-deputy path client_credentials already closes via the
+    # symmetric `client["client_type"] != "agent"` check below.
+    if client["client_type"] != "user_app":
+        raise HTTPException(status_code=400, detail={"error": "unauthorized_client",
+                                                     "error_description": "only user-facing apps may request token exchange"})
     if not subject_token or subject_token_type != config.JWT_TOKEN_TYPE:
         raise HTTPException(status_code=400, detail={"error": "invalid_request"})
     if not actor_token or actor_token_type != config.AGENT_ACTOR_TYPE:

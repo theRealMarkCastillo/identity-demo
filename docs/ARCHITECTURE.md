@@ -1,6 +1,41 @@
 # Architecture: Local Identity & Agent Authorization Demo
 
+## TL;DR
+
+Three kinds of caller talk to this system: a **human**, a **human's delegated agent** (an LLM copilot acting on their behalf), and a **headless agent** (a cron job or CLI with no human attached). Each gets a differently-shaped, cryptographically signed JWT from a custom OAuth 2.1 control plane. The JWT's claims (`sub`, `act.sub`, `scope`, `umask`) flow — unmodified, just pushed down as Postgres session variables — into the database, where row-level security and column-level masking make the *actual* enforcement decision. No component downstream of the control plane is trusted to "just do the right thing" with identity; each layer re-derives and re-checks it.
+
+The one picture:
+
+```mermaid
+flowchart TB
+    H["Human\n(password login)"] -->|"Authorization Code + PKCE"| CP
+    H -.->|"holds human JWT\nsub=user, umask"| AG["Delegated agent\n(LLM copilot)"]
+    AG -->|"RFC 8693 Token Exchange\nsubject_token=human JWT\nactor_token=agent:id"| CP["Control Plane\n(OAuth 2.1 AS)"]
+    HL["Headless agent\n(cron / CLI)"] -->|"Client Credentials"| CP
+
+    CP <-->|"IssueToken: permit/deny"| CEDAR["Cedar Policy Engine\n(platform.cedar_policies)"]
+
+    CP -->|"mint RS256 JWT\nsub=user, no act"| JH["Human JWT"]
+    CP -->|"mint RS256 JWT\nsub=user, act.sub=agent\nscope downscoped\numask forced masked"| JA["Delegated JWT"]
+    CP -->|"mint RS256 JWT\nsub=agent, no act\numask forced masked"| JHL["Headless JWT"]
+
+    JH --> WA["Web App"]
+    JA --> WA
+    JHL --> WA
+
+    WA -->|"verify_token(): sig + iss + aud\n+ exp + jti-revocation"| WA
+    WA -->|"run_with_identity(user_id, actor_id, umask)\nSET LOCAL per-transaction GUCs"| DB[("Postgres")]
+
+    DB --> RLS{"RLS: select_policy /\nmodify_human_only\nread app.user_id / app.actor_id"}
+    RLS -->|"rows this identity may see"| MASK["apply_mask()\nreads app.unmask_level"]
+    MASK -->|"raw or masked PII, per cell"| RESULT["Query result"]
+```
+
+The rest of this document is the "why" and the "exactly how" behind every box and arrow above. §7 has six more sequence diagrams that zoom into each arrow individually.
+
 ## 0. How to Read This Doc
+
+**Reviewing this for security, not building on it?** Jump to §8 (Threat Model), §11 (Security Properties), and §13 (Non-Goals) — read the "how to use this section" note at the end of §8 first, it tells you how to verify each claim against the actual code rather than taking the table on faith.
 
 If you're new to the demo, read in this order:
 
@@ -50,9 +85,11 @@ The visual signature in the UI:
 | | No actor (`act` absent) | Actor = agent |
 |---|---|---|
 | **Principal = human** | Human direct (#1) | Delegated agent (#2) |
-| **Principal = agent** | Headless agent (#3) | Nested delegation (out of scope — see §11) |
+| **Principal = agent** | Headless agent (#3) | Nested delegation (out of scope — see §13) |
 
-The cell "principal = human, actor = human" is meaningless (humans don't act on behalf of other humans in this model). The cell "principal = agent, actor = agent" is multi-hop delegation — explicitly out of scope (see §11). What remains is three cells, and that's the entire taxonomy.
+The cell "principal = human, actor = human" is meaningless (humans don't act on behalf of other humans in this model). The cell "principal = agent, actor = agent" is multi-hop delegation — explicitly out of scope (see §13). What remains is three cells, and that's the entire taxonomy.
+
+**This taxonomy is protocol-agnostic.** Nothing about `sub`/`act`/`scope`/`umask` assumes a browser, a REST API, or any specific transport. The same three principals and the same JWT shapes sit equally well behind a plain HTTP API, an [MCP](https://modelcontextprotocol.io/) server, or an [A2A](https://github.com/a2aproject/A2A) endpoint — the protocol only decides how the bytes get from caller to server; this taxonomy decides what the caller is *allowed to do* once they arrive. A2A is a useful stress-test of the model: an A2A call is agent-to-agent by definition, so it always lands in the right-hand column above — either "headless agent" (the calling agent has its own standing identity) or "nested delegation" (the calling agent is relaying a human's authority, which is exactly the case this demo's code doesn't yet handle — see §13 and PRODUCTION_PATTERNS.md §3.5). See PRODUCTION_PATTERNS.md §3.1 for how this plugs into MCP and A2A concretely.
 
 ## 3. Design Decisions: Why These Standards
 
@@ -66,7 +103,7 @@ OAuth 2.1 is the IETF's best-practices consolidation of OAuth 2.0. It drops lega
 - **Refresh token rotation.** OAuth 2.1 requires that each refresh replaces the old token. Our control plane revokes the old `jti` and issues a new one on every refresh, preventing stolen refresh tokens from being silently replayed.
 - **RFC 7009 revocation.** Explicit token kill-switch, required by OAuth 2.1.
 
-In short: OAuth 2.1 means we get the strongest OAuth-native posture out of the box — no legacy footguns, no optional security. Every flow in this demo would pass an OAuth 2.1 spec audit.
+In short: OAuth 2.1 means we get the strongest OAuth-native posture out of the box — no legacy footguns, no optional security. Every flow in this demo implements OAuth 2.1's mandatory security features (PKCE S256-only, no implicit/password grants, refresh rotation, RFC 7009 revocation). That's a narrower claim than "would pass a full audit" — this demo still skips things a real audit would flag (no HTTPS, in-memory auth codes, secrets in `.env`; see §13) that OAuth 2.1 itself doesn't mandate but a production deployment needs.
 
 ### RFC 8693 Token Exchange — delegated identity
 
@@ -177,10 +214,12 @@ The web app connects to Postgres as `app_session`, **not** as `postgres`. Postgr
 | Role | What it can do | Used by |
 |---|---|---|
 | `postgres` | Everything, bypasses RLS | `init.sql` only — schema setup |
-| `control_plane_admin` | Read/write `platform.*` tables, can't bypass RLS on `target.*` | Control plane (audit log + token records) |
+| `control_plane_admin` | `SUPERUSER` — read/write `platform.*` tables, and *would* bypass RLS on `target.*` if it ever queried it | Control plane (audit log + token records) |
 | `app_session` | CRUD on `target.*`, RLS enforced, no schema changes | Web app + cli-agent (the *only* role that runs user-driven queries) |
 
-If an attacker compromises the web app, they can issue queries as `app_session` — but RLS still filters what rows they can see, and they cannot `DROP TABLE`, alter policies, or impersonate other identities. The blast radius of a web app compromise is bounded by the database role's permissions.
+`control_plane_admin` is a superuser in this demo (`db/init.sql`, `CREATE ROLE control_plane_admin ... SUPERUSER`) — it is **not** RLS-safe by construction. It only stays out of `target.*` data because the control plane's code never queries those tables, not because the database stops it. Treat this as a residual risk, not a defense: production should make this role non-superuser and grant it only what it needs on `platform.*` (see §8 "Compromised DB admin" and §13).
+
+If an attacker compromises the web app, they can issue queries as `app_session` — but RLS still filters what rows they can see, and they cannot `DROP TABLE`, alter policies, or impersonate other identities. The blast radius of a web app compromise is bounded by the database role's permissions. The blast radius of a *control-plane* compromise is much larger, precisely because `control_plane_admin` is a superuser — see the residual-risk note above.
 
 This is why the web app never holds DB admin credentials. Production note: in a real deployment you'd also want network-level isolation (separate DB users per service, network policies, mTLS) — see §13 for the full list of production concerns.
 
@@ -255,7 +294,7 @@ These are decisions that don't drive the demo's identity story but are worth bei
 
 **Why BCrypt for password and `client_secret` hashing?** Three requirements: salted (so two users with the same password don't have the same hash), slow (so brute force is expensive), and tunable cost (so you can increase it as hardware speeds up). BCrypt hits all three with one algorithm and has been the safe default since the 1990s. The newer alternatives are **Argon2** (memory-hard, winner of the Password Hashing Competition, slightly better against GPU/ASIC attacks) and **scrypt** (similar memory-hard properties). For this demo, BCrypt is fine — Argon2 would be the choice for a greenfield production system today, and `passlib` makes the swap a one-line config change.
 
-**Why a single `audit_log` table for everything?** The schema has one `platform.audit_log` table that records token issuance, token exchange, refresh, revoke, RLS blocks, and (now) `cli-admin` actions. We could have split these into `platform.token_events`, `platform.rls_events`, `platform.admin_events` — but a single table makes the demo's narrative simpler ("look at the audit log to see everything that happened"). The `event_type` column discriminates, and the `details jsonb` carries event-specific fields. In production at scale you'd partition this table by time (monthly partitions) and consider an INSERT-only role to prevent tampering (currently any `control_plane_admin` can mutate it — see §11 Non-Goals).
+**Why a single `audit_log` table for everything?** The schema has one `platform.audit_log` table that records token issuance, token exchange, refresh, revoke, RLS blocks, and (now) `cli-admin` actions. We could have split these into `platform.token_events`, `platform.rls_events`, `platform.admin_events` — but a single table makes the demo's narrative simpler ("look at the audit log to see everything that happened"). The `event_type` column discriminates, and the `details jsonb` carries event-specific fields. In production at scale you'd partition this table by time (monthly partitions) and consider an INSERT-only role to prevent tampering (currently any `control_plane_admin` can mutate it — see §13 Non-Goals).
 
 **Why short TTLs (1h access, 8h refresh)?** The access token TTL is the *upper bound* on revocation latency without checking `jti` (which we do anyway, but the TTL is the safety net). 1 hour balances UX (users don't get logged out mid-task) against security (a leaked token is usable for at most an hour). The 8h refresh token covers a workday; refreshes happen transparently, so users rarely notice. Production systems with higher security needs use 15-minute access tokens; consumer apps with lower needs use 24h+. The pattern in this demo — short access + longer refresh + active revocation lookup — is the standard OAuth 2.1 recommendation.
 
@@ -504,8 +543,10 @@ The row-level access logic is in SQL because the database is the last line of de
 
 | Policy | Location | What it enforces |
 |---|---|---|
-| `select_policy` | `db/init.sql:218` | SELECT for any principal type, scoped by `current_user_id()` / `current_actor_id()` |
-| `modify_human_only` | `db/init.sql:234` | INSERT/UPDATE/DELETE only when `current_actor_id()` IS NULL — agents can never write |
+| `select_policy` | `db/init.sql`, search `CREATE POLICY select_policy` | SELECT for any principal type, scoped by `current_user_id()` / `current_actor_id()`, plus a role-aware branch that lets the `auditor` role see shared rows it doesn't own |
+| `modify_human_only` | `db/init.sql`, search `CREATE POLICY modify_human_only` | INSERT/UPDATE/DELETE only when `current_actor_id()` IS NULL — agents can never write |
+
+(Line numbers drift as `init.sql` grows — search by symbol name rather than trusting a cached line number.)
 
 Both policies read `current_user_id()` and `current_actor_id()` — helper functions defined earlier in `init.sql` that wrap `current_setting('app.user_id')` and `current_setting('app.actor_id')`.
 
@@ -527,9 +568,9 @@ The mapping from "role/agent" → "allowed scopes" is **data**, not code. Changi
 
 | Table | Location | What it stores |
 |---|---|---|
-| `platform.roles` | `db/init.sql:35` (DDL), `:46` (seed) | Role catalog: `senior_analyst`, `junior_analyst`, `auditor` |
-| `platform.role_scopes` | `db/init.sql:40` (DDL), `:51` (seed) | Role → scope rows: `senior_analyst` → R+W, `junior_analyst` → R, `auditor` → R |
-| `platform.agents` | `db/init.sql:105` (DDL) | Agent catalog with `default_scopes TEXT[]` column — what scope an agent gets by default during delegation |
+| `platform.roles` | `db/init.sql`, search `CREATE TABLE platform.roles` (DDL) / `INSERT INTO platform.roles` (seed) | Role catalog: `senior_analyst`, `junior_analyst`, `auditor` |
+| `platform.role_scopes` | `db/init.sql`, search `CREATE TABLE platform.role_scopes` (DDL) / `INSERT INTO platform.role_scopes` (seed) | Role → scope rows: `senior_analyst` → R+W, `junior_analyst` → R, `auditor` → R |
+| `platform.agents` | `db/init.sql`, search `CREATE TABLE platform.agents` (DDL) | Agent catalog with `default_scopes TEXT[]` column — what scope an agent gets by default during delegation |
 | `platform.clients` | `db/init.sql` (DDL) | OAuth client registry (web app + headless agents) with per-client `allowed_scopes` |
 
 #### Layer 3: Cedar policy engine (service-level gate)
@@ -718,16 +759,18 @@ sequenceDiagram
     W->>W: Verify aud == target-api
     W->>W: Verify exp > now (and iat < now)
     W->>W: Extract claims: sub, scope, act, client_id, jti
-    W->>DB: SELECT jti FROM platform.token_records WHERE jti=? AND revoked=FALSE
-    DB-->>W: row (active) or NULL (revoked)
+    W->>DB: SELECT revoked FROM platform.token_records WHERE jti=?
+    DB-->>W: revoked=FALSE (or TRUE, or no row)
     alt Token revoked or invalid
         W-->>C: 401 Unauthorized
     end
-    W->>W: Open transaction, call run_with_identity(sub, act.sub, scope)
-    W->>DB: SET LOCAL app.user_id, app.actor_id
+    W->>W: Open transaction, call run_with_identity(sub, act.sub, umask)
+    W->>DB: SET LOCAL app.user_id, app.actor_id, app.unmask_level
     W->>DB: (tool query)
     DB-->>W: result
 ```
+
+`verify_token()` in `web-app/app/jwt_verify.py` does all of the above — signature, `iss`, `aud`, `exp`, then the `jti` lookup — in one call. A missing `token_records` row is treated as not-revoked (every jti is recorded at issuance, so a missing row means the token predates this check, not that revocation was bypassed).
 
 ### 7.5 RLS Enforcement (database as last line of defense)
 
@@ -750,8 +793,9 @@ sequenceDiagram
         DB->>DB: Row silently excluded (no error — empty result set)
     end
     W->>DB: UPDATE target.transactions SET amount=9999 WHERE id=1
-    DB->>DB: RLS policy modify_human_only runs<br/>(actor_id is set → REJECTED)
-    DB-->>W: ERROR new row violates row-level security policy
+    DB->>DB: RLS policy modify_human_only's USING clause runs<br/>(actor_id is set → row excluded, not matched)
+    DB-->>W: UPDATE 0 (no error — the row simply isn't visible to update)
+    Note over W,DB: An AFTER STATEMENT trigger fires regardless of<br/>match count when current_actor_id() is set:
     W->>DB: INSERT platform.audit_log event=rls_block
     DB-->>W: audit recorded
     W->>DB: COMMIT (or ROLLBACK — GUCs reset)
@@ -856,7 +900,7 @@ This section enumerates the threats this demo defends against, the mechanism tha
 | **Headless agent accesses a specific user's rows** | RLS `current_user_id() IS NULL` branch. Headless agents only see rows where `is_shared=TRUE` — they cannot impersonate a user because there is no user `sub` to set. |
 | **Token theft via SQL injection** (attacker injects a different `sub` into a query) | Identity is set via Postgres GUCs, not query parameters. The SQL text never contains user identity — see §3 ("Postgres RLS via GUCs"). |
 | **Token theft via Postgres logs** | GUCs are session state, not in SQL text. They don't appear in `pg_stat_statements`, slow query log, or application logs. |
-| **Compromised agent reads raw PII** (SSN/PAN/email on a row it has RLS access to) | Principal-type floor: `compute_umask(..., is_agent=True)` always returns `'masked'`. Even if an agent's `default_scopes` contains `read:transactions.full`, the floor strips `.full` from the effective `scope` claim and forces `umask='masked'`. Three redundant checks at control plane, token layer, and DB (`apply_mask` reads `app.unmask_level`) — see §6.5. |
+| **Compromised agent reads raw PII** (SSN/PAN/email on a row it has RLS access to) | Principal-type floor: `derive_token_attrs(..., requested_principal_type="agent")` always returns `umask='masked'`. Even if an agent's `default_scopes` contains `read:transactions.full`, the floor strips `.full` from the effective `scope` claim and forces `umask='masked'`. Three redundant checks at control plane, token layer, and DB (`apply_mask` reads `app.unmask_level`) — see §6.5. |
 | **Compromised human role escalation** (a junior_analyst somehow gets `read:transactions.full` in their effective scope) | Role mapping is the only path to `.full`. If you can add to `platform.role_scopes` you can already mint tokens at will; this is "compromise of a privileged account," which is out of scope (see below). The `apply_mask` policy lookup would also begin returning raw values, which the audit trigger (`event_type='unmask_access'`) would surface. |
 | **Cross-tenant data leak** (request from user A inherits identity from a previous user B) | `SET LOCAL` is transaction-scoped. After commit/rollback, GUCs reset. Connection pool can't leak identity between requests — see §3. |
 | **LLM hallucinates a destructive action** | Tool calls run with the agent's identity. RLS rejects writes. The attempt is logged to `platform.audit_log` and surfaced in the UI as a BLOCKED result — see §10. |
@@ -880,7 +924,7 @@ These are real threats, but they're explicitly out of scope. Each is mitigated i
 | **LLM prompt injection bypasses tool guards** | The LLM is trusted to follow its system prompt; tools execute whatever the LLM asks for | Output filtering, structured tool constraints, separate "action approval" model, human-in-the-loop for destructive ops |
 | **Denial of service** | Demo has no rate limiting | Rate limiting at the edge, WAF, autoscaling, circuit breakers |
 | **Token theft via browser extensions / XSS** | Demo doesn't have CSP or strict cookie attributes | Strict CSP, `SameSite=strict` cookies, `__Host-` cookie prefix, output encoding |
-| **Authorization policy drift** (someone changes `platform.role_scopes` and breaks things silently) | No version history on the policy tables — see §13 | Cedar policies in `platform.cedar_policies` are version-controlled via the engine reload log; changes are audited via `admin_policy_*` events. Role/agent data changes still lack version history. |
+| **Authorization policy drift** (someone changes `platform.role_scopes` and breaks things silently) | No version history on the policy tables — see §13 | Cedar policy edits in `platform.cedar_policies` are last-write-wins (only `updated_at`, no history table) but every edit and reload is audited via `admin_policy_*` events, so you can reconstruct *when* a policy changed even without a diff. Role/agent data changes aren't even audited that much — see §13. |
 
 ### Residual risks (within scope, but worth naming)
 
@@ -891,6 +935,19 @@ Even within what this demo *does* defend, there are still residual risks:
 - **The LLM may not always attempt a write** during the demo (depends on the model and prompt). If the LLM never tries, the RLS-block story can't be shown — but the *defense* is still in place and provable via direct SQL.
 - **Masking is mask-by-default, not deny-by-default.** A column without a row in `platform.column_policies` returns its raw value to anyone with RLS access. If you add a new PII column to a table, you must also add a `column_policies` row, or the masking layer silently lets it through. Production would add a check constraint or trigger that raises when columns are added without policies, but for the demo this is operator discipline.
 - **The `apply_mask()` function is `VOLATILE` because it writes audit rows.** This blocks query folding and prevents some planner optimizations on the masked view. For the demo's small data this is invisible; production at scale would batch the audit inserts or move the audit-log writes to a `SECURITY DEFINER` wrapper function.
+
+### Token theft and replay — the residual risk that matters most
+
+Everything above assumes the bearer of a token is who they claim to be. If an access token is *stolen* — leaked in a log, grabbed via an XSS payload, sniffed off an unencrypted link — the thief can use it exactly as the legitimate holder could, for as long as it's valid. This is the sharpest edge of bearer tokens, worth calling out on its own rather than leaving it implicit in the OAuth 2.1 checklist:
+
+- **What a stolen token can do:** anything the `scope` and `umask` claims allow, scoped to whatever RLS lets that `sub`/`act.sub` see. A stolen *delegated agent* token is bounded by the downscoped, masked grant — the principal-type floor caps the damage even if the human's own token would have had raw clearance. A stolen *human* token with `.full` scope is the worst case: raw PII, for up to the token's remaining lifetime.
+- **What limits the exposure window:** short TTLs (1h access / 8h refresh) bound how long a stolen token works even if nobody notices the theft. In-band `jti` revocation (§3, §7.4/§7.6) means that *once the theft is detected*, killing the token takes effect on the very next request — no waiting for `exp`.
+- **What this demo does NOT do:** there's no sender-constraining. A JWT is a bearer credential — whoever holds the string can present it, and neither the web app nor Postgres asks "is this the same client that this token was issued to?" DPoP (RFC 9449) or mTLS client certificates bind a token to a specific key pair so a stolen token alone isn't enough; both are out of scope here (see §13).
+- **Why this is a *residual* risk and not a defended-against threat:** detection (noticing the theft happened) is not something this demo's mechanisms provide — there's no anomaly detection, no IP/device binding, no impossible-travel check. The demo's answer to theft is entirely about *response* (revoke, short TTL), not *prevention* or *detection*. Production systems close this gap with DPoP/mTLS (prevention) and SIEM/anomaly detection on the audit log (detection).
+
+### Consent and human-in-the-loop for delegation
+
+RFC 8693 answers "how does a token carry delegated authority," not "should this delegation have happened." This demo doesn't model consent: clicking a Copilot action mints and uses the delegated token in the same request, with no separate approval step. In production, granting an agent standing delegation (as opposed to demo's one-shot, per-click exchange) is a decision worth its own UX: what scope is the user actually agreeing to, for how long, and can they see (and revoke) which agents currently hold a delegation from them? The demo's "Revoke Agent Delegation" button is the *offboarding* half of that story; the *onboarding* half — an explicit consent screen before the first delegation, and step-up auth before minting a token with destructive scope — is a non-goal here (see §13) but is exactly the kind of control a production agent platform needs.
 
 ### How to use this section
 
@@ -926,7 +983,9 @@ A: JWTs are self-contained. The database (or any service) can verify them locall
 A: Scopes are fine-grained permissions (`read:transactions`, `write:transactions`). Roles are *bundles* of scopes (`senior_analyst` = R+W). Putting scopes in the token — and roles in a database table — lets you do scope intersection cleanly during token exchange (`effective = subject.scopes ∩ agent.default_scopes`, see §7.2) without re-issuing tokens when role definitions change.
 
 **Q: What stops an agent from claiming a different actor identity?**
-A: Two things. (1) The control plane verifies the actor exists in `platform.agents` and has `is_delegatable=TRUE` before issuing a token. (2) The web app only requests delegation for agents registered in its own config — so a malicious LLM can't ask for `act=agent_ceo_with_full_access`. See `control-plane/app/routes/token.py:_grant_token_exchange`.
+A: Three things. (1) `_grant_token_exchange` only accepts requests from a `client_type == "user_app"` client — an agent authenticating with its own `client_secret` cannot call the token-exchange grant at all, closing off the confused-deputy path where a compromised agent uses its own credentials to mint a delegated token naming a *different* agent as actor. (2) The control plane verifies the named actor exists in `platform.agents` and has `is_delegatable=TRUE` before issuing a token. (3) The web app only requests delegation for agents registered in its own config — so a malicious LLM can't ask for `act=agent_ceo_with_full_access`. See `control-plane/app/routes/token.py:_grant_token_exchange`.
+
+Worth naming directly: this whole mechanism — an agent cannot inherit the subject's full authority just by being asked to act on their behalf — is the textbook fix for the **confused deputy problem**. The agent (the deputy) is given a narrower, non-forgeable grant (the downscoped, `act`-tagged token) instead of the subject's own credentials, so it can't be tricked into misusing authority it never actually held.
 
 **Q: How is this different from an API gateway that injects user ID into requests?**
 A: An API gateway injecting user identity is a *trust* mechanism — if the gateway is misconfigured or compromised, the wrong identity propagates everywhere. RS256 JWTs are a *cryptographic* mechanism — every layer verifies the signature independently. The database doesn't have to trust the web app or the gateway; it verifies the token itself. Trust assumptions scale linearly with components; cryptographic verification scales with the key strength.
@@ -944,10 +1003,10 @@ A: RS256 signature verification with a cached JWKS is ~0.1ms. A Postgres `SET LO
 A: The signature verifies the token *was* issued and hasn't expired, but it can't revoke it. The `jti` lookup against `platform.token_records` lets the control plane kill a token instantly (RFC 7009) — the very next request returns 401, not after the `exp` window. Trade-off: ~0.5ms per request for sub-second revocation. Covered in depth in §3 ("Why in-band `jti` revocation").
 
 **Q: Can the LLM forge a request to bypass RLS?**
-A: No. The LLM doesn't have database credentials, network access, or any way to issue raw SQL. Every LLM tool call goes through the web app, which calls `run_with_identity(sub, act.sub, scope)` before executing the query. RLS sees the agent's identity regardless of what the LLM asks for. Even if the LLM emits a perfectly crafted SQL string, it can't bypass the GUCs the application sets.
+A: No. The LLM doesn't have database credentials, network access, or any way to issue raw SQL. Every LLM tool call goes through the web app, which calls `run_with_identity(sub, act.sub, umask)` before executing the query. RLS sees the agent's identity regardless of what the LLM asks for. Even if the LLM emits a perfectly crafted SQL string, it can't bypass the GUCs the application sets.
 
 **Q: Can a compromised agent see raw PII?**
-A: No — masked or not, agents see transformed cell values for every column with a policy. Three independent checks keep the agent from seeing raw values: (1) the control plane's `strip_full_suffix()` removes `.full` from the agent's effective scope claim, (2) `compute_umask(..., is_agent=True)` always returns `'masked'`, and (3) the DB's `apply_mask()` reads `app.unmask_level` and only returns raw when it's literally `'raw'`. See §6.5.
+A: No — masked or not, agents see transformed cell values for every column with a policy. Two independent checks keep the agent from seeing raw values: (1) the control plane's `derive_token_attrs(..., requested_principal_type="agent")` strips `.full` from the agent's effective scope claim AND always sets `umask='masked'` in the same call, and (2) the DB's `apply_mask()` reads `app.unmask_level` and only returns raw when it's literally `'raw'`. See §6.5.
 
 **Q: Why a security-barrier *and* a security-invoker view?**
 A: `security_barrier=true` prevents the planner from pushing WHERE clauses past the `apply_mask()` call (good for defense-in-depth). `security_invoker=true` is the *critical* one: without it, a view owned by a superuser (`postgres` in this demo) would be expanded with the view owner's privileges during planning, bypassing the FORCE ROW LEVEL SECURITY marker on the underlying table. PG 15+ added this option specifically to make view-based RLS reliable.
@@ -1009,7 +1068,7 @@ A:
 A: Single-user internal tools with no agent integration. Static read-only dashboards. Anything where the threat model doesn't include "compromised service," "agent privilege escalation," or "audit requirement." For those, a simple session cookie + role check at the app layer is fine. This pattern earns its complexity when you have **multiple principal types**, **delegated agents**, or **regulatory audit requirements**.
 
 **Q: How do I test this?**
-A: `make test` runs the verification suite (30+ scenarios). For new tests, the pattern is: (1) trigger an action, (2) query `platform.audit_log` to confirm the right event was recorded, (3) query the data table to confirm RLS allowed/denied as expected. The smoke test in RUNBOOK §4 is a good starting point.
+A: `make test` runs the verification suite (55 tests). For new tests, the pattern is: (1) trigger an action, (2) query `platform.audit_log` to confirm the right event was recorded, (3) query the data table to confirm RLS allowed/denied as expected. The smoke test in RUNBOOK §4 is a good starting point.
 
 ## 10. Audit & Observability
 
@@ -1051,9 +1110,9 @@ A: `make test` runs the verification suite (30+ scenarios). For new tests, the p
 | **Token verification** | Web-app fetches JWKS, verifies signature + `iss` + `aud` + `exp` on every request |
 | **Short-lived tokens** | 1h access, 8h refresh (humans only) |
 | **Scope downscoping** | During token exchange, effective scope = `subject.scopes ∩ agent.default_scopes` |
-| **Principal-type floor** | Non-human tokens get `umask='masked'` regardless of `.full` scopes (`roles.compute_umask`, `strip_full_suffix`) |
+| **Principal-type floor** | Non-human tokens get `umask='masked'` regardless of `.full` scopes (`roles.derive_token_attrs`) |
 | **Role-based authorization** | `platform.roles` + `platform.role_scopes` define what each role can do |
-| **Three-tier RLS** | Human / delegated / headless — each has a distinct access pattern |
+| **Three-tier RLS** | Human / delegated / headless — human and delegated read the same rows (owner's own, plus shared rows for the `auditor` role); headless reads shared rows only. The distinction that matters is **writes**: only human-direct can write, never delegated or headless. |
 | **Cell-level masking** | `apply_mask()` reads `app.unmask_level`; `target.transactions_masked` returns transformed PII when level != raw |
 | **RLS through views** | `security_invoker=true` makes superuser-owned views inherit RLS for the invoking user |
 | **CSRF protection** | `itsdangerous` tokens on all state-changing forms; OAuth flow protected by `state` + PKCE |
@@ -1104,7 +1163,8 @@ This is a **demo**. The following are explicitly out of scope:
 - **No rate limiting** — production needs it.
 - **LLM may not always attempt a write** — the demo is best when using a model that follows instructions. If the LLM never tries to write, the RLS block story can't be shown.
 - **No policy versioning** — `platform.role_scopes` and `platform.agents.default_scopes` are mutable; no audit of who changed them when.
-- **No delegation chains** — user → agent → sub-agent is not modeled. The `act` claim can technically be nested but our code only supports one level.
+- **No delegation chains** — user → agent → sub-agent is not modeled. If a delegated token (one that already has an `act` claim) is presented as the `subject_token` in a second token-exchange call, the code doesn't reject it and doesn't nest it either: `_grant_token_exchange` mints the new token with `sub=subject_claims["sub"]` (the original human) and the *new* actor, silently dropping the first `act`. So a two-hop exchange collapses to "human delegates to agent2," not "human → agent1 → agent2" — there's no real multi-hop delegation, and no explicit guard rejecting the attempt either. Don't rely on this collapsing behavior for anything security-relevant; it's simply what the current code happens to do, not a designed safeguard.
+- **No consent screen for delegation** — clicking a Copilot action mints and uses the delegated token in the same request. There's no separate "app X wants to act as you with scope Y, approve?" step, and no distinction between one-shot and standing delegation. See "Consent and human-in-the-loop for delegation" in §8.
 
 ## 14. External IDP Integration (Future Enhancement)
 

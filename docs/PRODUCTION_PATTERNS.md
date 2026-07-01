@@ -7,7 +7,7 @@ This is the **"what do I do with this?"** companion to [ARCHITECTURE.md](ARCHITE
 **Two audiences, one doc:**
 
 1. **§2 — Deployment archetypes.** You're shipping a system with users and agents and you need to know which production shape fits your constraints (multi-tenant SaaS, regulated industry, zero-trust, air-gapped, etc.). For each archetype: what transfers directly, what changes, what's added.
-2. **§3 — Products and services for AI agents.** You're building something *new* in the agent economy — an MCP server, an agent marketplace, an observability product, a permission broker — and you want to know how this demo's identity model fits. For each product category: what's the value-prop, what parts of the demo are your core, what's missing.
+2. **§3 — Products and services for AI agents.** You're building something *new* in the agent economy — an MCP server, an A2A endpoint, an agent marketplace, an observability product, a permission broker — and you want to know how this demo's identity model fits. For each product category: what's the value-prop, what parts of the demo are your core, what's missing.
 
 **§1 — Universal transfer checklist.** Before picking an archetype, scan this. Ten properties this demo gives you out of the box; ten properties every production system needs whether you use this pattern or not. The diff between those two sets is what you're actually adopting.
 
@@ -35,7 +35,7 @@ These ten properties are present in the demo **as built**. They show up in any s
 | 8 | **Non-superuser DB role** | Connection pools can't bypass RLS; blast radius of app compromise is bounded. | `app_session` grant in `init.sql` |
 | 9 | **Split-the-world token strategy** | Browser sessions are stateful; API tokens are stateless JWT; resource-server verifications don't need a callback. | `web-app/app/session.py` vs `jwt_verify.py` |
 | 10 | **Per-event audit trail** | Every token lifecycle event and every RLS block is recorded. Distinguishes "user did X" from "user's agent did X." | `platform.audit_log` + `platform.token_records` |
-| 11 | **Column-level masking with a principal-type floor** | PII cells return masked values to agents *unconditionally*, with raw clearance only for entitled humans. The mask decision lives in the DB, not the app. | `db/init.sql:apply_mask()` + `target.transactions_masked` + `roles.compute_umask` |
+| 11 | **Column-level masking with a principal-type floor** | PII cells return masked values to agents *unconditionally*, with raw clearance only for entitled humans. The mask decision lives in the DB, not the app. | `db/init.sql:apply_mask()` + `target.transactions_masked` + `roles.derive_token_attrs` |
 
 These are the properties you're adopting. They're not free — operating an AS, an audit log, and an RLS-aware schema all cost work — but they're the value-prop of the pattern.
 
@@ -244,31 +244,35 @@ Different problem set. The previous section is about deploying a system *with* a
 
 The product categories below are ordered by how close to market they are and how directly this demo's patterns apply.
 
-### 3.1 MCP Server with User Context
+### 3.1 MCP Server or A2A Endpoint with User Context
 
-**What it is.** You're building an [MCP server](https://modelcontextprotocol.io/) — Anthropic's protocol standardizing how AI agents connect to tools and data. Today most MCP servers run in the user's desktop context (Claude Desktop, Cursor). Tomorrow they run in shared infrastructure with multiple agents connecting.
+**What it is.** You're building a server that other agents connect to — either an [MCP server](https://modelcontextprotocol.io/) (Anthropic's protocol for how an agent connects to tools and data) or an [A2A](https://github.com/a2aproject/A2A) endpoint (the Linux Foundation's Agent2Agent protocol for how one agent calls another agent). Today most MCP servers run in the user's desktop context (Claude Desktop, Cursor); tomorrow both MCP and A2A run in shared infrastructure with many callers connecting concurrently.
 
-**The identity gap.** A naive MCP server doesn't know who the user is — the agent calls the MCP server, the MCP server returns data. Two agents (one for the user, one autonomous) calling the same server look identical. You can't enforce per-user authorization; you can't audit who the agent was acting for.
+**Why these two protocols get one section, not two.** Neither MCP nor A2A defines its own identity or authorization model — deliberately. MCP's auth story is still maturing (see below). A2A goes further and says so explicitly in its own spec: it treats the calling agent "as a standard enterprise application," authenticates at the HTTP transport layer using OAuth 2.0 / JWTs, and an agent's `AgentCard` just *declares which of those standard schemes it accepts* — the protocol punts entirely on how you mint, verify, downscope, or revoke those credentials. That gap is exactly this demo's subject matter. Whichever protocol sits in front, the server behind it needs answers to "who is this token really for," "what can it actually see," and "can I audit and kill it" — and those answers come from the control plane + RLS pattern, not from the protocol.
+
+**The identity gap.** A naive MCP server or A2A endpoint doesn't know who the human user is — the caller sends a request, the server returns data. Two callers (one carrying a human's delegated authority, one fully autonomous) calling the same endpoint look identical over the wire. You can't enforce per-user authorization; you can't audit who — or which chain of agents — was acting for whom.
 
 **How this demo fits.**
 
-- The MCP server *is* an OAuth 2.1 resource server in this model. It exposes `/.well-known/oauth-protected-resource` (RFC 9728), accepts bearer tokens, and verifies them via JWKS — exactly the pattern in the demo's web-app.
-- For delegation: the user's agent presents a `sub=user_X, act.sub=agent_Y` JWT. The MCP server's tool executes under that identity. RLS at the MCP server's backend gives per-user row filtering without the MCP server trusting the agent.
-- The MCP server can also *exchange* a token for the user-specific tool execution via RFC 8693 — useful when the agent holds a long-lived token and the MCP needs a per-tool scoped one.
+- The MCP server or A2A endpoint *is* an OAuth 2.1 resource server in this model. It exposes `/.well-known/oauth-protected-resource` (RFC 9728) or (for A2A) declares its accepted scheme in its `AgentCard`, accepts bearer tokens, and verifies them via JWKS — exactly the pattern in the demo's web-app.
+- For delegation: the caller presents a `sub=user_X, act.sub=agent_Y` JWT. The server's tool/skill executes under that identity. RLS at the server's backend gives per-user row filtering without the server trusting the caller's own claims about who it's acting for.
+- The server can also *exchange* a token for the user-specific tool execution via RFC 8693 — useful when the caller holds a long-lived token and the tool needs a per-call scoped one.
+- **A2A-specific nuance:** the caller is itself another agent, not a human's client. That maps onto this demo's taxonomy one of two ways: if the calling agent has its own standing identity with no human behind it, it's this demo's **headless agent** pattern (client credentials, `sub=agent_id`, no `act`). If the calling agent is relaying a human's delegated authority (it already holds a token with `act.sub` set), the receiving endpoint should *extend* that chain rather than replace it — which is precisely the nested-`act` problem this demo's code doesn't yet solve (see §3.5 below). A2A's own security write-ups flag agent impersonation and credential replay as risks the protocol leaves to implementers; RFC 8693 downscoping + short TTLs + in-band `jti` revocation (ARCHITECTURE.md §3, §8) is a concrete answer to exactly that gap.
 
 **Concrete shape.**
 
 ```text
-User → Browser-based Claude (via MCP) → MCP server (your product)
-                                            │
-                                            ├─ Verify Bearer JWT (sub=user, act.sub=agent)
-                                            ├─ Run tool with SET LOCAL user_id, actor_id
-                                            └─ Audit row: principal=user, actor=agent
+User → Browser-based Claude (via MCP)     → MCP server (your product)
+Agent A → A2A request (per its AgentCard) → A2A endpoint (your product)
+                                                │
+                                                ├─ Verify Bearer JWT (sub=user, act.sub=agent)
+                                                ├─ Run tool/skill with SET LOCAL user_id, actor_id
+                                                └─ Audit row: principal=user, actor=agent (or actor chain)
 ```
 
-**What you'd build.** Your MCP server has the same shape as the demo's web-app: FastAPI / Express, JWKS cache, the `run_with_identity()` pattern, an RLS-aware backend. The protocol glue (MCP JSON-RPC over stdio / HTTP / SSE) sits in front of the same handler shape.
+**What you'd build.** Your MCP server or A2A endpoint has the same shape as the demo's web-app: FastAPI / Express, JWKS cache, the `run_with_identity()` pattern, an RLS-aware backend. The protocol glue (MCP JSON-RPC over stdio / HTTP / SSE, or A2A's JSON-RPC 2.0 over HTTPS + SSE) sits in front of the same handler shape — the identity layer underneath doesn't change based on which protocol is talking to it.
 
-**What's missing.** MCP-client identity attestation is still maturing. Today most MCP clients are desktop apps where the "user" is implicit. As soon as MCP has a real OAuth client story, you'd adopt it and this demo's RFC 8693 story fits cleanly.
+**What's missing.** MCP-client identity attestation is still maturing — today most MCP clients are desktop apps where the "user" is implicit. A2A is further along on paper (it names OAuth 2.0 and JWTs directly) but, per its own spec, leaves `AgentCard` authenticity, impersonation, and replay defenses entirely to implementers. As soon as either protocol has a real, verifiable client-identity story, you'd adopt it and this demo's RFC 8693 story fits cleanly underneath.
 
 ---
 
@@ -361,9 +365,9 @@ Vendor's agent → your API:  Bearer <token>
 
 ### 3.5 Multi-Agent Orchestration (Nested Delegation)
 
-**What it is.** A user delegates to an orchestrator agent. The orchestrator delegates to specialist sub-agents. The sub-agents run tools against your API or DB. Each delegation step needs the same principal/actor discipline. The audit must read like a call graph: *user → orchestrator → research_agent → tool_call*.
+**What it is.** A user delegates to an orchestrator agent. The orchestrator delegates to specialist sub-agents. The sub-agents run tools against your API or DB. Each delegation step needs the same principal/actor discipline. The audit must read like a call graph: *user → orchestrator → research_agent → tool_call*. This is the exact scenario an **A2A** deployment produces at scale (§3.1) — every A2A call from one agent to another is, in this demo's terms, another hop that should extend an `act` chain rather than replace it.
 
-**How this demo fits — with caveats.** The demo's `act` claim supports nesting in principle (RFC 8693 allows `act` to be an object tree). The demo's code currently collapses `act` to one level. Production orchestration needs the full tree.
+**How this demo fits — with caveats.** The demo's `act` claim supports nesting in principle (RFC 8693 allows `act` to be an object tree). The demo's code currently collapses `act` to one level — see the "No delegation chains" bullet in ARCHITECTURE.md §13 for exactly what that means today: a second token-exchange hop doesn't nest, it silently replaces the first actor. Production orchestration (and any real A2A deployment with more than one hop) needs the full tree.
 
 **What you'd build.**
 
@@ -439,7 +443,7 @@ Vendor's agent → your API:  Bearer <token>
 | "We're a B2B SaaS adding agent support to our existing app" | §2.1 Multi-tenant SaaS | Most common starting point. Schema changes (add `tid`) are small; tenant provisioning UI is the lift. |
 | "We're regulated — HIPAA / SOC 2 / FedRAMP customer tomorrow" | §2.2 Regulated Industry | Audit-log immutability is the hard part; do that first. Token TTL changes are cheap. |
 | "Our enterprise customers have their own IdPs" | §2.4 Federated / Multi-IdP | First IdP is cheap. Plan for the operational cost of the fifth. |
-| "We're an MCP server builder" | §3.1 MCP Server with User Context | The demo's web app is your reference implementation; the protocol layer is the new code. |
+| "We're an MCP server or A2A endpoint builder" | §3.1 MCP Server or A2A Endpoint with User Context | The demo's web app is your reference implementation; the protocol layer (MCP JSON-RPC or A2A's JSON-RPC 2.0 + AgentCard) is the new code. Both protocols punt on identity — this demo is the part they leave out. |
 | "We're building an agent platform / marketplace" | §3.2 Agent Platform | Use this demo's control plane as the start; add the vendor manifest format and review workflow. |
 | "We're building observability / audit for agents" | §3.3 Agent Observability | Take the audit-log schema; build the query layer; sell the dashboard. |
 | "Third-party agents will call our API" | §3.4 BYO-Agent API | Hybrid: 3.1's verifier + 3.2's onboarding. Vendor SDK is the focal point. |

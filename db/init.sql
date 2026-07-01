@@ -56,11 +56,10 @@ INSERT INTO platform.roles VALUES
   ('auditor',        'Read access to own + shared transactions, no writes (PII masked)');
 
 -- senior_analyst also holds .full variants: their effective scope includes the
--- .full suffix, which the control plane's `compute_umask()` reads as "raw
--- clearance". The principal-type floor (enforced at the control plane --
--- `roles.compute_umask` and `roles.strip_full_suffix`) makes agents always
--- masked even if their effective scopes included .full, so junior_analyst and
--- auditor stay masked.
+-- .full suffix, which the control plane's `derive_token_attrs()` reads as
+-- "raw clearance". The principal-type floor (enforced at the control plane
+-- in `roles.derive_token_attrs`) makes agents always masked even if their
+-- effective scopes included .full, so junior_analyst and auditor stay masked.
 INSERT INTO platform.role_scopes VALUES
   ('senior_analyst', 'read:transactions'),
   ('senior_analyst', 'write:transactions'),
@@ -289,9 +288,15 @@ ALTER TABLE target.transactions FORCE ROW LEVEL SECURITY;
 -- SELECT: any authenticated principal can SELECT, scoped by principal type
 CREATE POLICY select_policy ON target.transactions FOR SELECT
 USING (
-  -- Human direct: own rows
+  -- Human direct: own rows, plus shared rows for the auditor role. The role
+  -- lookup is by current_user_id() (a GUC, not request input), so this stays
+  -- a database-verified fact rather than a claim the app could spoof.
   (current_actor_id() IS NULL AND current_user_id() IS NOT NULL
-     AND owner_user_id = current_user_id())
+     AND (owner_user_id = current_user_id()
+          OR (is_shared = TRUE AND EXISTS (
+                SELECT 1 FROM platform.users u
+                WHERE u.user_id = current_user_id() AND u.role = 'auditor'
+              ))))
   OR
   -- UI-delegated agent: read user's own rows
   (current_actor_id() IS NOT NULL AND current_user_id() IS NOT NULL
