@@ -257,7 +257,7 @@ Everything else can be covered in Q&A. If the masking story specifically comes u
 
 ## 6. Where to Dig Deeper After the Demo
 
-**Verification first:** run `make test` after `make up` — the suite covers 58 tests across all three principal types (RLS + masking) and is the fastest way to confirm your install is wired up correctly. See `tests/`.
+**Verification first:** run `make test` after `make up` — the suite covers 59 tests across all three principal types (RLS + masking) and is the fastest way to confirm your install is wired up correctly. See `tests/`.
 
 If you want to understand how each piece is built, the files below are the entry points. Read in this order if you're new to the codebase:
 

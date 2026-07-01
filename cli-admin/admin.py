@@ -239,7 +239,7 @@ def cmd_client_rotate_secret(args):
 # ============================================================================
 
 def cmd_token_list(args):
-    sql = "SELECT jti, sub, act_sub, client_id, scope, exp, revoked, created_at FROM platform.token_records"
+    sql = "SELECT jti, sub, act_sub, client_id, scope, exp, revoked, created_at, act_chain FROM platform.token_records"
     clauses = []
     params = []
     if args.sub:
@@ -263,9 +263,10 @@ def cmd_token_list(args):
     for r in rows:
         status = "REVOKED" if r["revoked"] else "active "
         act = f" act={r['act_sub']}" if r["act_sub"] else ""
+        chain = f" chain={'->'.join(r['act_chain'])}" if r["act_chain"] else ""
         jti_str = str(r["jti"])
         print(
-            f"[{status}] jti={jti_str[:8]}.. sub={r['sub']:<20}{act} "
+            f"[{status}] jti={jti_str[:8]}.. sub={r['sub']:<20}{act}{chain} "
             f"client={r['client_id']:<20} scope={r['scope']:<25} exp={r['exp'].isoformat()}"
         )
 

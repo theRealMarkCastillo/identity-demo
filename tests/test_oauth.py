@@ -556,3 +556,25 @@ def test_delegation_depth_cap_enforced():
     hop5 = _exchange(hop4_token, "agent_etl_nightly", auth=("web-app", WEB_APP_CLIENT_SECRET))
     assert hop5.status_code == 400
     assert "max depth" in hop5.json()["error_description"]
+
+
+def test_revoked_subject_token_cannot_be_exchanged():
+    """RFC 7009 revocation must stop a token from being exchanged for a new
+    delegated token, not just from being used directly -- otherwise
+    revoking a compromised or unwanted grant doesn't stop new chain hops
+    from being minted downstream of it.
+    """
+    human_token = _get_human_token()
+    hop1 = _exchange(human_token, "orchestrator_main", auth=("web-app", WEB_APP_CLIENT_SECRET))
+    assert hop1.status_code == 200
+    hop1_token = hop1.json()["access_token"]
+
+    requests.post(
+        f"{CONTROL_PLANE}/oauth/revoke",
+        auth=("web-app", WEB_APP_CLIENT_SECRET),
+        data={"token": hop1_token},
+    )
+
+    r2 = _exchange(hop1_token, "research_specialist", auth=("orchestrator_main", ORCHESTRATOR_AGENT_SECRET))
+    assert r2.status_code == 400
+    assert r2.json()["error"] == "invalid_grant"

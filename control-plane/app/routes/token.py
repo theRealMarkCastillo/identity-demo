@@ -297,6 +297,15 @@ async def _grant_token_exchange(client, subject_token, subject_token_type, audie
     except Exception as e:
         raise HTTPException(status_code=400, detail={"error": "invalid_grant", "error_description": f"subject token invalid: {e}"})
 
+    # verify_jwt only checks signature/iss/aud/exp -- it doesn't know about
+    # revocation. Without this, revoking a token (RFC 7009) doesn't stop it
+    # from being exchanged for a brand-new, un-revoked delegated token: the
+    # holder just mints a fresh jti downstream and keeps going. Chain
+    # extension must die at the same jti a direct API call would.
+    subject_jti = subject_claims.get("jti")
+    if subject_jti and audit.is_token_revoked(subject_jti):
+        raise HTTPException(status_code=400, detail={"error": "invalid_grant", "error_description": "subject token has been revoked"})
+
     # Only user-facing apps may START a delegation. An agent client may
     # EXTEND a chain, but only one it is currently the actor in -- proving
     # "I hold this authority and I'm delegating it further" rather than
