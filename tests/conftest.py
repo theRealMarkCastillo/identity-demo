@@ -16,6 +16,8 @@ APP_DB_PASSWORD = os.environ.get("APP_DB_PASSWORD", "app_session_pw")
 
 WEB_APP_CLIENT_SECRET = os.environ.get("WEB_APP_CLIENT_SECRET", "web_app_client_secret_change_me")
 ETL_AGENT_SECRET = os.environ.get("ETL_AGENT_SECRET", "agent_etl_secret_change_me")
+ORCHESTRATOR_AGENT_SECRET = os.environ.get("ORCHESTRATOR_AGENT_SECRET", "agent_orchestrator_secret_change_me")
+SPECIALIST_AGENT_SECRET = os.environ.get("SPECIALIST_AGENT_SECRET", "agent_specialist_secret_change_me")
 
 
 def get_db_conn():

@@ -41,6 +41,7 @@ class Config:
     AGENT_ACTOR_PREFIX = "agent:"
     TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
     JWT_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:jwt"
+    MAX_DELEGATION_DEPTH = int(_optional("CP_MAX_DELEGATION_DEPTH", "4"))
 
     @property
     def db_dsn(self) -> str:

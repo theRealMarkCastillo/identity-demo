@@ -106,6 +106,15 @@ INSERT INTO platform.clients VALUES
   ('agent_copilot_99',  'agent',    '$2b$10$DVhn3STJGN0RInzhlnKad.GJHUG7GjOeXiLs.xsljNMO4dau766zO',
     NULL, ARRAY['read:transactions'], TRUE),
   ('agent_etl_nightly', 'agent',    '$2b$10$8k21z5kKbmKsSjsVHHEN2ueoihzEWs1Qf91E7INFd/Ni3Or7CsGt6',
+    NULL, ARRAY['read:transactions'], TRUE),
+  -- Demo chain for nested delegation (see docs/PRODUCTION_PATTERNS.md §3.5):
+  -- orchestrator_main and research_specialist need their own client_secret
+  -- so they can authenticate to /oauth/token themselves to extend a chain
+  -- they are currently the actor in. browser_browser_agent is a chain leaf
+  -- (nothing delegates further to it) so it has no client row.
+  ('orchestrator_main',    'agent', '$2b$10$1VfrlQXcHIJ2NpqcxW3dleB5FoIPw//cTfRfJ62E2x.Rod.QgnPq6',
+    NULL, ARRAY['read:transactions'], TRUE),
+  ('research_specialist',  'agent', '$2b$10$EMhO3eZHzIIvvjgNGR08COpxMu0nzU74dzZYjgLpJwQX2Fm3OOvWa',
     NULL, ARRAY['read:transactions'], TRUE);
 
 GRANT SELECT ON platform.clients TO app_session;
@@ -122,7 +131,11 @@ CREATE TABLE platform.agents (
 
 INSERT INTO platform.agents VALUES
   ('agent_copilot_99',  'Analyst copilot (UI-delegatable)', ARRAY['read:transactions','read:transactions.full'], TRUE),
-  ('agent_etl_nightly', 'Nightly ETL monitor (headless)',   ARRAY['read:transactions'], FALSE);
+  ('agent_etl_nightly', 'Nightly ETL monitor (headless)',   ARRAY['read:transactions'], FALSE),
+  -- Demo chain for nested delegation: user -> orchestrator -> specialist -> browser tool.
+  ('orchestrator_main',      'Orchestrator agent (first hop of a delegation chain)',  ARRAY['read:transactions'], TRUE),
+  ('research_specialist',    'Specialist agent (second hop, delegated by orchestrator)', ARRAY['read:transactions'], TRUE),
+  ('browser_browser_agent',  'Browser tool agent (chain leaf, third hop)',            ARRAY['read:transactions'], TRUE);
 
 GRANT SELECT ON platform.agents TO app_session;
 
@@ -137,7 +150,13 @@ CREATE TABLE platform.token_records (
   scope       TEXT NOT NULL,
   exp         TIMESTAMPTZ NOT NULL,
   revoked     BOOLEAN NOT NULL DEFAULT FALSE,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Full delegation chain, newest actor first, e.g.
+  -- ["research_specialist", "orchestrator_main"]. NULL for non-delegated
+  -- tokens. act_sub above always matches act_chain[0] for delegated tokens --
+  -- act_sub stays a flat column so existing single-hop queries/indexes are
+  -- unaffected; act_chain is additive for chain-aware queries.
+  act_chain   JSONB
 );
 
 CREATE INDEX idx_token_records_sub ON platform.token_records(sub);

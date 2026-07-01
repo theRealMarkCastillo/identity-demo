@@ -32,6 +32,14 @@ export ADMIN_DB_USER=control_plane_admin   # default; superuser for write access
     --delegatable
 ./admin.py agent update agent_data_analyst --scopes read:transactions,read:reports
 ./admin.py agent delete agent_data_analyst
+# NOTE: `agent add` only inserts into platform.agents. That makes the agent a
+# valid delegation TARGET (something you can delegate to), but it can't
+# itself extend a delegation chain further -- for that it also needs a
+# platform.clients row (client_type='agent', its own secret) so it can
+# authenticate to /oauth/token as itself. Register one manually (see
+# db/init.sql's orchestrator_main / research_specialist rows for the pattern)
+# if you want a custom agent to be able to delegate further, not just receive
+# delegation.
 
 # Clients
 ./admin.py client list

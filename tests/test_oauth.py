@@ -4,7 +4,13 @@ import hashlib
 import secrets
 
 import requests
-from conftest import CONTROL_PLANE, WEB_APP_CLIENT_SECRET, ETL_AGENT_SECRET
+from conftest import (
+    CONTROL_PLANE,
+    WEB_APP_CLIENT_SECRET,
+    ETL_AGENT_SECRET,
+    ORCHESTRATOR_AGENT_SECRET,
+    SPECIALIST_AGENT_SECRET,
+)
 
 
 def test_health():
@@ -432,3 +438,121 @@ def test_userinfo_for_delegated_token_shows_act():
 def test_userinfo_no_token():
     r = requests.get(f"{CONTROL_PLANE}/oauth/userinfo")
     assert r.status_code == 401
+
+
+def _get_human_token(user_id="user_123", password="pw123", scope="read:transactions write:transactions"):
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+    r = requests.post(
+        f"{CONTROL_PLANE}/authorize",
+        data={
+            "user_id": user_id,
+            "password": password,
+            "client_id": "web-app",
+            "redirect_uri": "http://localhost:13000/callback",
+            "scope": scope,
+            "state": "x",
+            "code_challenge": challenge,
+        },
+        allow_redirects=False,
+    )
+    code = r.headers["location"].split("code=")[1].split("&")[0]
+    r2 = requests.post(
+        f"{CONTROL_PLANE}/oauth/token",
+        auth=("web-app", WEB_APP_CLIENT_SECRET),
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "code_verifier": verifier,
+            "redirect_uri": "http://localhost:13000/callback",
+        },
+    )
+    return r2.json()["access_token"]
+
+
+def _exchange(subject_token, agent_id, auth):
+    return requests.post(
+        f"{CONTROL_PLANE}/oauth/token",
+        auth=auth,
+        data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "subject_token": subject_token,
+            "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+            "audience": "target-api",
+            "actor_token": f"agent:{agent_id}",
+            "actor_token_type": "urn:example:params:oauth:token-type:agent-id",
+        },
+    )
+
+
+def test_three_hop_delegation_chain_nests_act():
+    """user -> orchestrator_main -> research_specialist -> browser_browser_agent.
+
+    Each hop is minted by whoever currently holds the authority: the
+    web-app starts the chain, then each agent extends it using its own
+    client credentials. The final act claim nests newest-actor-first.
+    """
+    human_token = _get_human_token()
+
+    r1 = _exchange(human_token, "orchestrator_main", auth=("web-app", WEB_APP_CLIENT_SECRET))
+    assert r1.status_code == 200
+    hop1_token = r1.json()["access_token"]
+
+    # orchestrator_main (using its own credentials) delegates further to
+    # research_specialist, presenting hop1's token as the subject.
+    r2 = _exchange(hop1_token, "research_specialist", auth=("orchestrator_main", ORCHESTRATOR_AGENT_SECRET))
+    assert r2.status_code == 200
+    hop2_token = r2.json()["access_token"]
+
+    r3 = _exchange(hop2_token, "browser_browser_agent", auth=("research_specialist", SPECIALIST_AGENT_SECRET))
+    assert r3.status_code == 200
+    hop3_token = r3.json()["access_token"]
+
+    # Inspect the final act chain via /oauth/userinfo (avoids hand-decoding
+    # the JWT payload in the test itself).
+    r4 = requests.get(
+        f"{CONTROL_PLANE}/oauth/userinfo",
+        headers={"Authorization": f"Bearer {hop3_token}"},
+    )
+    body = r4.json()
+    assert body["sub"] == "user_123"  # root principal never changes across hops
+    assert body["act"] == {
+        "sub": "browser_browser_agent",
+        "act": {
+            "sub": "research_specialist",
+            "act": {"sub": "orchestrator_main"},
+        },
+    }
+
+
+def test_agent_cannot_extend_chain_it_is_not_the_actor_in():
+    """Confused-deputy check: research_specialist can't hijack a chain where
+    orchestrator_main is the current actor, even with valid credentials of
+    its own -- an agent may only extend a chain it is CURRENTLY the actor in.
+    """
+    human_token = _get_human_token()
+    hop1_token = _exchange(human_token, "orchestrator_main", auth=("web-app", WEB_APP_CLIENT_SECRET)).json()["access_token"]
+
+    r2 = _exchange(hop1_token, "browser_browser_agent", auth=("research_specialist", SPECIALIST_AGENT_SECRET))
+    assert r2.status_code == 400
+    assert r2.json()["error"] == "unauthorized_client"
+
+
+def test_delegation_depth_cap_enforced():
+    """A chain longer than MAX_DELEGATION_DEPTH (4) is rejected."""
+    human_token = _get_human_token()
+    token = _exchange(human_token, "orchestrator_main", auth=("web-app", WEB_APP_CLIENT_SECRET)).json()["access_token"]
+    token = _exchange(token, "research_specialist", auth=("orchestrator_main", ORCHESTRATOR_AGENT_SECRET)).json()["access_token"]
+    token = _exchange(token, "browser_browser_agent", auth=("research_specialist", SPECIALIST_AGENT_SECRET)).json()["access_token"]
+    # Chain is now 3 deep. A 4th hop is still within MAX_DELEGATION_DEPTH;
+    # the web-app can always extend a chain regardless of current actor
+    # (it's the trusted root of the OAuth flow), so use it to push to depth
+    # 4, then depth 5, which must be rejected.
+    hop4 = _exchange(token, "agent_copilot_99", auth=("web-app", WEB_APP_CLIENT_SECRET))
+    assert hop4.status_code == 200
+    hop4_token = hop4.json()["access_token"]
+    hop5 = _exchange(hop4_token, "agent_etl_nightly", auth=("web-app", WEB_APP_CLIENT_SECRET))
+    assert hop5.status_code == 400
+    assert "max depth" in hop5.json()["error_description"]

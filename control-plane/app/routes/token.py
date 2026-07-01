@@ -80,6 +80,39 @@ def _cedar_authorize(
                                                      "error_description": errors})
 
 
+def _extend_act_chain(existing_act: dict | None, new_actor_sub: str) -> dict:
+    """Wrap an existing `act` one level deeper for a new delegation hop.
+
+    Convention: the newest actor stays outermost (`act.sub` is always whoever
+    is *currently* acting; `act.act.sub` is who delegated to them, and so on
+    back through the chain). This keeps every existing single-hop consumer
+    (web-app's `agent_claims["act"]["sub"]`, Postgres's `current_actor_id()`)
+    correct without changes, and makes "is this agent currently the acting
+    party" an O(1) check instead of a walk to the bottom of the chain.
+    """
+    new_act = {"sub": new_actor_sub}
+    if existing_act is not None:
+        new_act["act"] = existing_act
+    return new_act
+
+
+def _act_chain_depth(act: dict | None) -> int:
+    depth = 0
+    while act is not None:
+        depth += 1
+        act = act.get("act")
+    return depth
+
+
+def _act_chain_list(act: dict | None) -> list[str]:
+    """Flatten a nested act chain to a list, newest actor first."""
+    chain = []
+    while act is not None:
+        chain.append(act.get("sub"))
+        act = act.get("act")
+    return chain
+
+
 def _client_credentials_from_request(request: Request, form_client_id: str | None, form_client_secret: str | None) -> tuple[str, str]:
     """Extract client_id/client_secret from Basic header or form body."""
     auth = request.headers.get("authorization", "")
@@ -252,15 +285,6 @@ async def _grant_refresh_token(client, refresh_token):
 
 
 async def _grant_token_exchange(client, subject_token, subject_token_type, audience, actor_token, actor_token_type):
-    # Only user-facing apps may request delegation. Without this gate, an
-    # agent client (which knows its own client_secret) could present a
-    # captured subject_token and an actor_token naming a DIFFERENT agent,
-    # minting itself a delegated token it was never meant to hold -- a
-    # confused-deputy path client_credentials already closes via the
-    # symmetric `client["client_type"] != "agent"` check below.
-    if client["client_type"] != "user_app":
-        raise HTTPException(status_code=400, detail={"error": "unauthorized_client",
-                                                     "error_description": "only user-facing apps may request token exchange"})
     if not subject_token or subject_token_type != config.JWT_TOKEN_TYPE:
         raise HTTPException(status_code=400, detail={"error": "invalid_request"})
     if not actor_token or actor_token_type != config.AGENT_ACTOR_TYPE:
@@ -272,6 +296,31 @@ async def _grant_token_exchange(client, subject_token, subject_token_type, audie
         subject_claims = verify_jwt(subject_token)
     except Exception as e:
         raise HTTPException(status_code=400, detail={"error": "invalid_grant", "error_description": f"subject token invalid: {e}"})
+
+    # Only user-facing apps may START a delegation. An agent client may
+    # EXTEND a chain, but only one it is currently the actor in -- proving
+    # "I hold this authority and I'm delegating it further" rather than
+    # "I'm minting a fresh delegation naming an unrelated actor." Without
+    # this, an agent client (which knows its own client_secret) could
+    # present a captured subject_token and an actor_token naming a
+    # DIFFERENT, unrelated agent, minting itself a delegated token it was
+    # never meant to hold -- the same confused-deputy shape client_credentials
+    # already closes via the symmetric `client["client_type"] != "agent"`
+    # check below.
+    existing_act = subject_claims.get("act")
+    if client["client_type"] == "agent":
+        current_actor = (existing_act or {}).get("sub")
+        if current_actor != client["client_id"]:
+            raise HTTPException(status_code=400, detail={"error": "unauthorized_client",
+                                                         "error_description": "agent may only extend a delegation chain it is currently the actor in"})
+    elif client["client_type"] != "user_app":
+        raise HTTPException(status_code=400, detail={"error": "unauthorized_client",
+                                                     "error_description": "only user-facing apps or the current actor may request token exchange"})
+
+    new_depth = _act_chain_depth(existing_act) + 1
+    if new_depth > config.MAX_DELEGATION_DEPTH:
+        raise HTTPException(status_code=400, detail={"error": "invalid_request",
+                                                     "error_description": f"delegation chain exceeds max depth ({config.MAX_DELEGATION_DEPTH})"})
 
     # Strip "agent:" prefix from actor_token
     if not actor_token.startswith(config.AGENT_ACTOR_PREFIX):
@@ -301,17 +350,19 @@ async def _grant_token_exchange(client, subject_token, subject_token_type, audie
     umask = attrs["umask"]
     jti = str(uuid.uuid4())
 
+    new_act = _extend_act_chain(existing_act, agent_id)
+    act_chain = _act_chain_list(new_act)
     access_token, _ = mint_jwt(
         sub=subject_claims["sub"],
         scope=scope_str,
         client_id=client["client_id"],
         exp_seconds=config.JWT_TTL_SECONDS,
-        act={"sub": agent_id},
+        act=new_act,
         umask=umask,
         jti=jti,
     )
     exp_dt = datetime.fromtimestamp(int(time.time()) + config.JWT_TTL_SECONDS, tz=timezone.utc)
-    audit.record_token(jti, subject_claims["sub"], agent_id, client["client_id"], scope_str, exp_dt)
+    audit.record_token(jti, subject_claims["sub"], agent_id, client["client_id"], scope_str, exp_dt, act_chain=act_chain)
     audit.log_audit(
         event_type="token_exchange",
         sub=subject_claims["sub"],
@@ -325,6 +376,8 @@ async def _grant_token_exchange(client, subject_token, subject_token_type, audie
             "subject_scope": " ".join(sorted(subject_scopes)),
             "umask": umask,
             "floor_applied": attrs["floor_stripped"],
+            "act_chain": act_chain,
+            "chain_depth": new_depth,
         },
     )
     return {

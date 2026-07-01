@@ -22,7 +22,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 Adopting this pattern for a real system, or building a product on top of it? See [docs/PRODUCTION_PATTERNS.md](docs/PRODUCTION_PATTERNS.md) for seven production deployment archetypes (multi-tenant SaaS, regulated industry, zero-trust, federated, high-throughput, on-premise, edge) and six product categories for AI agents (MCP/A2A servers, agent platforms, observability, BYO-agent APIs, multi-agent orchestration, permission brokers). This demo's identity model is protocol-agnostic — it fits underneath a plain REST API, an MCP server, or an A2A endpoint the same way, since none of those protocols define their own identity/authorization layer.
 
 ## Verification
-55 unit + integration tests covering all three principal types (human direct, delegated agent, headless agent) plus Cedar policy logic and column-level masking paths. Run `make test` after `make up`. Seven one-click demo buttons in the dashboard, including side-by-side raw-vs-masked diff per PII cell.
+58 unit + integration tests covering all three principal types (human direct, delegated agent, headless agent), multi-hop delegation chains, Cedar policy logic, and column-level masking paths. Run `make test` after `make up`. Seven one-click demo buttons in the dashboard, including side-by-side raw-vs-masked diff per PII cell.
 
 ## The Story
 Most AI agent demos use a single service account to talk to the database. That means:

@@ -257,7 +257,7 @@ The product categories below are ordered by how close to market they are and how
 - The MCP server or A2A endpoint *is* an OAuth 2.1 resource server in this model. It exposes `/.well-known/oauth-protected-resource` (RFC 9728) or (for A2A) declares its accepted scheme in its `AgentCard`, accepts bearer tokens, and verifies them via JWKS — exactly the pattern in the demo's web-app.
 - For delegation: the caller presents a `sub=user_X, act.sub=agent_Y` JWT. The server's tool/skill executes under that identity. RLS at the server's backend gives per-user row filtering without the server trusting the caller's own claims about who it's acting for.
 - The server can also *exchange* a token for the user-specific tool execution via RFC 8693 — useful when the caller holds a long-lived token and the tool needs a per-call scoped one.
-- **A2A-specific nuance:** the caller is itself another agent, not a human's client. That maps onto this demo's taxonomy one of two ways: if the calling agent has its own standing identity with no human behind it, it's this demo's **headless agent** pattern (client credentials, `sub=agent_id`, no `act`). If the calling agent is relaying a human's delegated authority (it already holds a token with `act.sub` set), the receiving endpoint should *extend* that chain rather than replace it — which is precisely the nested-`act` problem this demo's code doesn't yet solve (see §3.5 below). A2A's own security write-ups flag agent impersonation and credential replay as risks the protocol leaves to implementers; RFC 8693 downscoping + short TTLs + in-band `jti` revocation (ARCHITECTURE.md §3, §8) is a concrete answer to exactly that gap.
+- **A2A-specific nuance:** the caller is itself another agent, not a human's client. That maps onto this demo's taxonomy one of two ways: if the calling agent has its own standing identity with no human behind it, it's this demo's **headless agent** pattern (client credentials, `sub=agent_id`, no `act`). If the calling agent is relaying a human's delegated authority (it already holds a token with `act.sub` set), the receiving endpoint should *extend* that chain rather than replace it — which this demo's code now does (see §3.5 below for the bounded, newest-outer implementation). A2A's own security write-ups flag agent impersonation and credential replay as risks the protocol leaves to implementers; RFC 8693 downscoping + short TTLs + in-band `jti` revocation (ARCHITECTURE.md §3, §8) is a concrete answer to exactly that gap.
 
 **Concrete shape.**
 
@@ -367,34 +367,36 @@ Vendor's agent → your API:  Bearer <token>
 
 **What it is.** A user delegates to an orchestrator agent. The orchestrator delegates to specialist sub-agents. The sub-agents run tools against your API or DB. Each delegation step needs the same principal/actor discipline. The audit must read like a call graph: *user → orchestrator → research_agent → tool_call*. This is the exact scenario an **A2A** deployment produces at scale (§3.1) — every A2A call from one agent to another is, in this demo's terms, another hop that should extend an `act` chain rather than replace it.
 
-**How this demo fits — with caveats.** The demo's `act` claim supports nesting in principle (RFC 8693 allows `act` to be an object tree). The demo's code currently collapses `act` to one level — see the "No delegation chains" bullet in ARCHITECTURE.md §13 for exactly what that means today: a second token-exchange hop doesn't nest, it silently replaces the first actor. Production orchestration (and any real A2A deployment with more than one hop) needs the full tree.
+**How this demo fits — now implemented, bounded.** This demo now implements nested `act` chains: `_extend_act_chain` in `control-plane/app/routes/token.py` wraps the existing `act` one level deeper on every token-exchange hop, and each hop's scope is the intersection of the subject's current scope and the new agent's `default_scopes` — so capability narrowing at each step happens automatically, without any extra code. An agent can extend a chain only if it's *currently* the actor in it (`subject_claims.act.sub == calling_client_id`), which is what makes orchestrator-initiated chaining safe: an agent forwards authority it already holds, it can't mint a fresh delegation naming an unrelated actor. The chain is capped by `MAX_DELEGATION_DEPTH` (default 4).
 
-**What you'd build.**
-
-- **Nested `act` chains.** Each delegation passes the existing `act` and adds a new layer. The final JWT that hits your DB has:
-  ```
-  {
-    "sub": "user_123",
+One convention choice worth calling out if you're implementing this yourself: **the newest actor stays outermost**, not the oldest. `act.sub` is always whoever is currently acting; `act.act.sub` is who delegated to them, and so on back through history:
+```
+{
+  "sub": "user_123",
+  "act": {
+    "sub": "browser_browser_agent",
     "act": {
-      "sub": "orchestrator_main",
+      "sub": "research_specialist",
       "act": {
-        "sub": "research_specialist",
-        "act": {
-          "sub": "browser_browser_agent"
-        }
+        "sub": "orchestrator_main"
       }
     }
   }
-  ```
-- **`act_chain` helper in the DB.** The audit log's `act_sub` column should arguably be `act_chain text[]` or a `jsonb` path. PG/RLS helpers walk the chain and check "does the *root* principal own this row?"
-- **Capability narrowing at each step.** Orchestrator can invoke specialist X; specialist X has scopes `[read:web, read:db]`; specialist X delegates to browser-tool with scope `[read:web]` only. The intersection discipline applies at every hop.
-- **Audit fidelity.** One row per logical action, with the full `act_chain` so an investigator can reconstruct the path. Volume is a concern — a busy multi-agent system produces 10x the audit rows of a single-agent one. Plan partitioning and sampling accordingly.
+}
+```
+This is the opposite of putting the first delegate outermost. The reason: every consumer that only needs "who's acting right now" (RLS's `current_actor_id()`, the web-app's `agent_claims["act"]["sub"]`) reads just the top level and stays correct at any chain depth — and it's what makes the "is this agent currently the actor" check above an O(1) read instead of a walk to the bottom of the chain.
+
+**What's still a genuine production delta** (this demo's bounded version doesn't need these, but a real deployment might):
+- **Unbounded depth with real capacity planning**, rather than a small fixed cap — this demo's cap (4) is a sanity limit, not a scale limit.
+- **`act_chain` as a first-class, indexed column for cross-cutting queries** — this demo adds `act_chain JSONB` to `platform.token_records` (populated at mint time) precisely for this, but a high-volume production system would want it on every audit row, not just token issuance, and probably wants a dedicated index or a separate append-only event stream rather than one shared `audit_log` table.
+- **Audit volume management.** A busy multi-agent system produces far more audit rows than a single-agent one. Plan partitioning and sampling accordingly.
+- **RLS reasoning about the whole chain**, not just the current actor. This demo's RLS policies only ever look at `current_actor_id()` (the top of the chain) — they don't need "does the *root* principal own this row" reasoning for this demo's access model, but a system with per-hop row visibility rules would need that.
 
 **Concrete shape.**
 
 ```sql
 -- Audit row produced by an orchestrator's specialist's tool call
-{event_type: tool_call, sub: user_123, act_sub: research_specialist, act_chain: [orchestrator_main, research_specialist], result: success, details: {...}}
+{event_type: tool_call, sub: user_123, act_sub: research_specialist, act_chain: [research_specialist, orchestrator_main], result: success, details: {...}}
 ```
 
 **Why this matters now.** LangGraph, CrewAI, and AutoGen are all shipping multi-agent primitives. Without an audit story, the products are gated out of regulated deployments. The first platform that builds this well will own the regulated-agent market.

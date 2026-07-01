@@ -85,11 +85,13 @@ The visual signature in the UI:
 | | No actor (`act` absent) | Actor = agent |
 |---|---|---|
 | **Principal = human** | Human direct (#1) | Delegated agent (#2) |
-| **Principal = agent** | Headless agent (#3) | Nested delegation (out of scope — see §13) |
+| **Principal = agent** | Headless agent (#3) | Not modeled by this demo's UI — see below |
 
-The cell "principal = human, actor = human" is meaningless (humans don't act on behalf of other humans in this model). The cell "principal = agent, actor = agent" is multi-hop delegation — explicitly out of scope (see §13). What remains is three cells, and that's the entire taxonomy.
+The cell "principal = human, actor = human" is meaningless (humans don't act on behalf of other humans in this model). What remains is three cells, and that's the entire taxonomy — chaining (below) doesn't add a fourth cell, it deepens what's *inside* cell #2's `act`.
 
-**This taxonomy is protocol-agnostic.** Nothing about `sub`/`act`/`scope`/`umask` assumes a browser, a REST API, or any specific transport. The same three principals and the same JWT shapes sit equally well behind a plain HTTP API, an [MCP](https://modelcontextprotocol.io/) server, or an [A2A](https://github.com/a2aproject/A2A) endpoint — the protocol only decides how the bytes get from caller to server; this taxonomy decides what the caller is *allowed to do* once they arrive. A2A is a useful stress-test of the model: an A2A call is agent-to-agent by definition, so it always lands in the right-hand column above — either "headless agent" (the calling agent has its own standing identity) or "nested delegation" (the calling agent is relaying a human's authority, which is exactly the case this demo's code doesn't yet handle — see §13 and PRODUCTION_PATTERNS.md §3.5). See PRODUCTION_PATTERNS.md §3.1 for how this plugs into MCP and A2A concretely.
+**Delegation chains live inside cell #2, not as a new cell.** `act` can itself carry a bounded chain of agents (`sub=user, act={sub: agent_N, act: {sub: agent_N-1, ...}}`), capped by `MAX_DELEGATION_DEPTH` (see §5, §7.2). The newest actor is always outermost — `act.sub` is whoever is currently acting, regardless of chain depth — so `sub` stays the same human principal throughout; the principal never becomes an agent partway through a chain. The cell "principal = agent, actor = agent" would only occur if a *headless* agent's own token were fed back in as a `subject_token` to start a fresh chain — nothing in the code explicitly forbids this at the API level, but no UI flow in this demo does it, so it's untested and not a designed feature.
+
+**This taxonomy is protocol-agnostic.** Nothing about `sub`/`act`/`scope`/`umask` assumes a browser, a REST API, or any specific transport. The same three principals and the same JWT shapes sit equally well behind a plain HTTP API, an [MCP](https://modelcontextprotocol.io/) server, or an [A2A](https://github.com/a2aproject/A2A) endpoint — the protocol only decides how the bytes get from caller to server; this taxonomy decides what the caller is *allowed to do* once they arrive. A2A is a useful stress-test of the model: an A2A call is agent-to-agent by definition, so it's either this demo's **headless agent** pattern (the calling agent has its own standing identity) or a case of the calling agent relaying a human's authority, which now extends the delegation chain inside cell #2's `act` rather than replacing it (bounded by `MAX_DELEGATION_DEPTH` — see PRODUCTION_PATTERNS.md §3.5). See PRODUCTION_PATTERNS.md §3.1 for how this plugs into MCP and A2A concretely.
 
 ## 3. Design Decisions: Why These Standards
 
@@ -369,6 +371,8 @@ These are decisions that don't drive the demo's identity story but are worth bei
   "act": { "sub": "agent_copilot_99" }  // present ONLY for delegated tokens
 }
 ```
+
+`act` can itself nest one level deeper per additional delegation hop — `act.act.sub`, `act.act.act.sub`, and so on, up to `MAX_DELEGATION_DEPTH`. The outermost `act.sub` is always whoever is *currently* acting, regardless of chain depth; see §7.2 and PRODUCTION_PATTERNS.md §3.5 for the full shape and why that ordering was chosen.
 
 ### Refresh + revocation
 
@@ -704,6 +708,8 @@ sequenceDiagram
     W->>DB: COMMIT (GUCs reset)
 ```
 
+This diagram shows the web-app starting a chain (hop 1). An agent can also call this same endpoint itself to *extend* a chain it's currently the actor in — same shape, but `W` becomes the calling agent and `subject_token` is the previous hop's token; see §9 FAQ "What stops an agent from claiming a different actor identity?" and §13 for the depth cap.
+
 ### 7.3 Client Credentials (Headless Agent)
 
 ```mermaid
@@ -983,7 +989,7 @@ A: JWTs are self-contained. The database (or any service) can verify them locall
 A: Scopes are fine-grained permissions (`read:transactions`, `write:transactions`). Roles are *bundles* of scopes (`senior_analyst` = R+W). Putting scopes in the token — and roles in a database table — lets you do scope intersection cleanly during token exchange (`effective = subject.scopes ∩ agent.default_scopes`, see §7.2) without re-issuing tokens when role definitions change.
 
 **Q: What stops an agent from claiming a different actor identity?**
-A: Three things. (1) `_grant_token_exchange` only accepts requests from a `client_type == "user_app"` client — an agent authenticating with its own `client_secret` cannot call the token-exchange grant at all, closing off the confused-deputy path where a compromised agent uses its own credentials to mint a delegated token naming a *different* agent as actor. (2) The control plane verifies the named actor exists in `platform.agents` and has `is_delegatable=TRUE` before issuing a token. (3) The web app only requests delegation for agents registered in its own config — so a malicious LLM can't ask for `act=agent_ceo_with_full_access`. See `control-plane/app/routes/token.py:_grant_token_exchange`.
+A: Four things. (1) A `user_app` client (the web-app) can start or extend any chain, but an `agent` client can only *extend* a chain it is **currently** the actor in — `_grant_token_exchange` checks `subject_claims.act.sub == calling_client_id` before allowing an agent to delegate further. This closes the confused-deputy path where a compromised agent uses its own credentials to mint a delegation naming a *different, unrelated* agent as actor; it can only forward authority it already, verifiably, holds. (2) The control plane verifies the named actor exists in `platform.agents` and has `is_delegatable=TRUE` before issuing a token, at every hop. (3) Chains are capped at `MAX_DELEGATION_DEPTH`, so this can't be abused to build an arbitrarily long, hard-to-audit chain. (4) The web app only requests delegation for agents registered in its own config — so a malicious LLM can't ask for `act=agent_ceo_with_full_access`. See `control-plane/app/routes/token.py:_grant_token_exchange`.
 
 Worth naming directly: this whole mechanism — an agent cannot inherit the subject's full authority just by being asked to act on their behalf — is the textbook fix for the **confused deputy problem**. The agent (the deputy) is given a narrower, non-forgeable grant (the downscoped, `act`-tagged token) instead of the subject's own credentials, so it can't be tricked into misusing authority it never actually held.
 
@@ -1068,7 +1074,7 @@ A:
 A: Single-user internal tools with no agent integration. Static read-only dashboards. Anything where the threat model doesn't include "compromised service," "agent privilege escalation," or "audit requirement." For those, a simple session cookie + role check at the app layer is fine. This pattern earns its complexity when you have **multiple principal types**, **delegated agents**, or **regulatory audit requirements**.
 
 **Q: How do I test this?**
-A: `make test` runs the verification suite (55 tests). For new tests, the pattern is: (1) trigger an action, (2) query `platform.audit_log` to confirm the right event was recorded, (3) query the data table to confirm RLS allowed/denied as expected. The smoke test in RUNBOOK §4 is a good starting point.
+A: `make test` runs the verification suite (58 tests). For new tests, the pattern is: (1) trigger an action, (2) query `platform.audit_log` to confirm the right event was recorded, (3) query the data table to confirm RLS allowed/denied as expected. The smoke test in RUNBOOK §4 is a good starting point.
 
 ## 10. Audit & Observability
 
@@ -1127,8 +1133,9 @@ Terms used throughout this document, with the precise meaning intended here.
 | Term | Definition |
 |---|---|
 | **Principal** | The entity ultimately responsible for an action. In the JWT, this is the `sub` claim. A human user is the principal of their own actions; a headless agent is its own principal. |
-| **Actor** | The entity that actually executed the action on behalf of the principal (if different). In RFC 8693, this is the `act.sub` claim. In this demo, only the delegated agent has an actor distinct from the principal — and in that case, the human is the principal, the agent is the actor. |
+| **Actor** | The entity that actually executed the action on behalf of the principal (if different). In RFC 8693, this is the `act.sub` claim. In this demo, only the delegated agent has an actor distinct from the principal — and in that case, the human is the principal, the agent is the actor. `act` can itself nest (`act.act.sub`, etc.) to represent a chain of delegations; the outermost `act.sub` is always the *current* actor, no matter how deep the chain — see "Delegation chain" below. |
 | **Delegation** | The act of a principal granting an actor the right to act on their behalf with (typically) reduced permissions. Modeled here by RFC 8693 token exchange. |
+| **Delegation chain** | Multiple hops of delegation (e.g. user → orchestrator → specialist), represented as nested `act` claims. Newest actor is outermost. Capped at `MAX_DELEGATION_DEPTH` (default 4). An agent may extend a chain only if it's currently the actor in it — see `control-plane/app/routes/token.py:_grant_token_exchange` and PRODUCTION_PATTERNS.md §3.5. |
 | **Downscoping** | Reducing a token's permissions to the intersection of the subject's allowed scopes and the actor's allowed scopes. A read-only copilot cannot be granted a write scope even if the human user has it. |
 | **Scope** | A named permission, e.g., `read:transactions`, `write:transactions`. Issued by the control plane and bound to a JWT at issuance. Enforced by both the web app (token scope check) and the database (RLS). |
 | **Role** | A named bundle of scopes assigned to a human user (e.g., `senior_analyst` → R+W; `junior_analyst` → R). Roles live in `platform.roles` and `platform.role_scopes`. Roles only apply to human users — agents get scopes directly from `platform.agents.default_scopes`. |
@@ -1163,7 +1170,7 @@ This is a **demo**. The following are explicitly out of scope:
 - **No rate limiting** — production needs it.
 - **LLM may not always attempt a write** — the demo is best when using a model that follows instructions. If the LLM never tries to write, the RLS block story can't be shown.
 - **No policy versioning** — `platform.role_scopes` and `platform.agents.default_scopes` are mutable; no audit of who changed them when.
-- **No delegation chains** — user → agent → sub-agent is not modeled. If a delegated token (one that already has an `act` claim) is presented as the `subject_token` in a second token-exchange call, the code doesn't reject it and doesn't nest it either: `_grant_token_exchange` mints the new token with `sub=subject_claims["sub"]` (the original human) and the *new* actor, silently dropping the first `act`. So a two-hop exchange collapses to "human delegates to agent2," not "human → agent1 → agent2" — there's no real multi-hop delegation, and no explicit guard rejecting the attempt either. Don't rely on this collapsing behavior for anything security-relevant; it's simply what the current code happens to do, not a designed safeguard.
+- **Delegation chains are bounded, not unbounded.** `user → orchestrator → specialist → tool` chaining is implemented (`_extend_act_chain` in `control-plane/app/routes/token.py`), capped at `MAX_DELEGATION_DEPTH` (default 4, `CP_MAX_DELEGATION_DEPTH`). An agent may only extend a chain it is *currently* the actor in (`subject_claims.act.sub == calling_client_id`) — see §7.2 and the FAQ. What's still a non-goal: RLS itself doesn't reason about chain depth (it only ever looks at the single current actor via `current_actor_id()`), and a headless agent's own token being fed back in as a fresh chain's `subject_token` is technically unguarded at the API level, even though no UI flow in this demo does it.
 - **No consent screen for delegation** — clicking a Copilot action mints and uses the delegated token in the same request. There's no separate "app X wants to act as you with scope Y, approve?" step, and no distinction between one-shot and standing delegation. See "Consent and human-in-the-loop for delegation" in §8.
 
 ## 14. External IDP Integration (Future Enhancement)

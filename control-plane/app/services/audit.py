@@ -35,14 +35,23 @@ def log_audit(
         conn.commit()
 
 
-def record_token(jti: str, sub: str, act_sub: str | None, client_id: str, scope: str, exp_ts) -> None:
+def record_token(
+    jti: str,
+    sub: str,
+    act_sub: str | None,
+    client_id: str,
+    scope: str,
+    exp_ts,
+    act_chain: list[str] | None = None,
+) -> None:
     with get_pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO platform.token_records
-                   (jti, sub, act_sub, client_id, scope, exp)
-                   VALUES (%s, %s, %s, %s, %s, %s)""",
-                (jti, sub, act_sub, client_id, scope, exp_ts),
+                   (jti, sub, act_sub, client_id, scope, exp, act_chain)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (jti, sub, act_sub, client_id, scope, exp_ts,
+                 json.dumps(act_chain) if act_chain else None),
             )
         conn.commit()
 
