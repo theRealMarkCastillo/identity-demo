@@ -256,7 +256,8 @@ The demo uses **two different auth mechanisms** depending on who the client is:
 |---|---|---|
 | **Browser → web app** | Signed session cookie (`itsdangerous` URLSafeTimedSerializer) | Stateful — server can revoke by deleting the session cookie. Browser UX needs "stay logged in" and "logout everywhere." |
 | **Web app → control plane** | None — same Python process | Internal function calls |
-| **Web app / cli-agent → DB** | JWT in `Authorization: Bearer` header (verified by `run_with_identity`) | Stateless — distributed verification. The DB itself checks the signature. |
+| **Web app → DB** | Fetches its own/exchanged/headless JWT, verifies it (`jwt_verify.verify_token` — signature, `iss`, `aud`, `exp`, `jti` revocation), then pushes the verified claims into Postgres GUCs via `run_with_identity` | Stateless — distributed verification on every request. `run_with_identity` itself doesn't verify anything; it trusts claims that already passed `verify_token`. |
+| **cli-agent → DB** | Fetches a headless JWT via `client_credentials`, but does **not** verify or use it to derive DB identity — `with_headless_identity()` (`cli-agent/tools.py`) sets `app.actor_id` directly from its own local `config.AGENT_ID` | cli-agent already holds a trusted local secret (the DB password); the OAuth round-trip still matters (Cedar gate, scope intersection, a real audit-log row), but isn't the thing gating *this* process's own DB access. See §13 for the consequence: revoking this token doesn't stop cli-agent's own next write, only paths that verify it (the web app's headless proxy, `/oauth/introspect`). |
 
 This is the **split-the-world pattern** (§3 "Why JWT at all?") in action within a single codebase. Browser sessions are stateful because the browser is a known, semi-trusted client that benefits from instant server-side revocation ("logout everywhere"). API tokens are stateless because the resource servers (the database, the control plane's `/oauth/userinfo`, etc.) can't all share a session store and shouldn't need to.
 
@@ -687,7 +688,17 @@ sequenceDiagram
     Note over W: User clicked "Copilot" — has a valid access JWT in session
 
     W->>CP: POST /oauth/token<br/>grant_type=token-exchange<br/>subject_token=<user JWT><br/>actor_token=agent:agent_copilot_99<br/>actor_token_type=...agent
-    CP->>CP: Verify subject JWT signature (own public key)
+    CP->>CP: Verify subject JWT signature, iss, aud, exp
+    CP->>DB: SELECT revoked FROM platform.token_records WHERE jti=subject_jti
+    DB-->>CP: revoked?
+    alt subject token revoked
+        CP-->>W: 400 invalid_grant (subject token revoked)
+    end
+    CP->>CP: Confused-deputy check: if caller is an agent client,<br/>subject_claims.act.sub must equal the caller's own client_id
+    CP->>CP: Depth check: chain_depth(subject.act) + 1 ≤ MAX_DELEGATION_DEPTH
+    alt confused-deputy mismatch or depth exceeded
+        CP-->>W: 400 unauthorized_client / invalid_request
+    end
     CP->>DB: SELECT agent WHERE agent_id=agent_copilot_99
     DB-->>CP: agent + default_scopes + is_delegatable
     CP->>CEDAR: is_authorized(IssueToken,<br/>principal=Agent, resource=TokenRequest(grant_type=token_exchange, subject_scopes))
@@ -708,7 +719,7 @@ sequenceDiagram
     W->>DB: COMMIT (GUCs reset)
 ```
 
-This diagram shows the web-app starting a chain (hop 1). An agent can also call this same endpoint itself to *extend* a chain it's currently the actor in — same shape, but `W` becomes the calling agent and `subject_token` is the previous hop's token; see §9 FAQ "What stops an agent from claiming a different actor identity?" and §13 for the depth cap.
+This diagram shows the web-app starting a chain (hop 1, so the confused-deputy check trivially passes — `client_type == "user_app"` skips the `act.sub` comparison). An agent can also call this same endpoint itself to *extend* a chain it's currently the actor in — same shape, but `W` becomes the calling agent, `subject_token` is the previous hop's token, and the confused-deputy check now compares `subject.act.sub` against the calling agent's own `client_id`. See §9 FAQ "What stops an agent from claiming a different actor identity?" and §13 for the depth-cap rationale.
 
 ### 7.3 Client Credentials (Headless Agent)
 
@@ -1174,6 +1185,7 @@ This is a **demo**. The following are explicitly out of scope:
 - **No policy versioning** — `platform.role_scopes` and `platform.agents.default_scopes` are mutable; no audit of who changed them when.
 - **Delegation chains are bounded, not unbounded.** `user → orchestrator → specialist → tool` chaining is implemented (`_extend_act_chain` in `control-plane/app/routes/token.py`), capped at `MAX_DELEGATION_DEPTH` (default 4, `CP_MAX_DELEGATION_DEPTH`). An agent may only extend a chain it is *currently* the actor in (`subject_claims.act.sub == calling_client_id`) — see §7.2 and the FAQ. What's still a non-goal: RLS itself doesn't reason about chain depth (it only ever looks at the single current actor via `current_actor_id()`), and a headless agent's own token being fed back in as a fresh chain's `subject_token` is technically unguarded at the API level, even though no UI flow in this demo does it.
 - **No consent screen for delegation** — clicking a Copilot action mints and uses the delegated token in the same request. There's no separate "app X wants to act as you with scope Y, approve?" step, and no distinction between one-shot and standing delegation. See "Consent and human-in-the-loop for delegation" in §8.
+- **`cli-agent` doesn't verify its own headless token before using it.** It fetches a real `client_credentials` JWT (Cedar-gated, audited, `umask` forced masked), but `with_headless_identity()` (`cli-agent/tools.py`) sets `app.actor_id` straight from its own local `config.AGENT_ID`, not from that token's verified claims — unlike the web app's headless demo path (`/action/trigger-headless`), which does call `_verify_or_401()` first. Practical effect: revoking a headless agent's token (`cli-admin token revoke-all --client-id <agent>`) stops the web app's proxy path and `/oauth/introspect`, but not `cli-agent`'s own next write — that process is gated by possession of its DB password and OAuth client secret, both static local credentials, not by the token. This mirrors a real production distinction (revoking an OAuth grant ≠ rotating a service's own infrastructure credentials), but it's not something this demo deliberately teaches — it's an artifact of `cli-agent` being a minimal standalone script. See §3 "Why split between browser sessions and API JWTs?" for the corrected mechanism table.
 
 ## 14. External IDP Integration (Future Enhancement)
 
