@@ -53,12 +53,15 @@ def exchange_code_for_tokens(code: str, code_verifier: str) -> dict:
         return r.json()
 
 
-def exchange_for_agent_token(subject_jwt: str, agent_id: str) -> dict:
-    """RFC 8693 token exchange: subject_token = human JWT, actor_token = agent:<id>"""
+def exchange_for_agent_token(subject_jwt: str, agent_id: str, auth: tuple[str, str] | None = None) -> dict:
+    """RFC 8693 token exchange: subject_token = human JWT (or a prior hop's
+    agent JWT), actor_token = agent:<id>. `auth` defaults to the web-app's
+    own credentials (starting a fresh chain); pass an agent's own
+    credentials to extend a chain that agent is currently the actor in."""
     with httpx.Client() as client:
         r = client.post(
             f"{config.CONTROL_PLANE_URL}/oauth/token",
-            auth=(config.CLIENT_ID, config.CLIENT_SECRET),
+            auth=auth or (config.CLIENT_ID, config.CLIENT_SECRET),
             data={
                 "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
                 "subject_token": subject_jwt,

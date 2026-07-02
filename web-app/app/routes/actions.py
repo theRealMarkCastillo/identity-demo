@@ -329,6 +329,69 @@ def action_copilot_full(request: Request, csrf_token: str = Form(...)):
 
 
 # ----------------------------------------------------------------------------
+# Delegation chain: user -> orchestrator_main -> research_specialist -> browser_browser_agent
+# ----------------------------------------------------------------------------
+@router.post("/action/delegation-chain")
+def action_delegation_chain(request: Request, csrf_token: str = Form(...)):
+    """Three-hop RFC 8693 chain. The web-app starts it (as itself, same as
+    every other Copilot button); each agent then extends it using its OWN
+    client credentials, exercising the same confused-deputy-safe path the
+    test suite covers (`_grant_token_exchange` in
+    control-plane/app/routes/token.py) from a button instead of curl.
+    """
+    verify_csrf(request, csrf_token)
+    sess = _require_session(request)
+    human_jwt = sess["tokens"]["access_token"]
+
+    if not (config.ORCHESTRATOR_AGENT_SECRET and config.SPECIALIST_AGENT_SECRET):
+        raise HTTPException(
+            status_code=503,
+            detail="ORCHESTRATOR_AGENT_SECRET / SPECIALIST_AGENT_SECRET not set. "
+                   "See .env.example.",
+        )
+
+    hop1 = oauth_client.exchange_for_agent_token(human_jwt, "orchestrator_main")
+    hop2 = oauth_client.exchange_for_agent_token(
+        hop1["access_token"], "research_specialist",
+        auth=("orchestrator_main", config.ORCHESTRATOR_AGENT_SECRET),
+    )
+    hop3 = oauth_client.exchange_for_agent_token(
+        hop2["access_token"], "browser_browser_agent",
+        auth=("research_specialist", config.SPECIALIST_AGENT_SECRET),
+    )
+    _cache_agent_token(sess, hop3, requested_scopes=["read:transactions"])
+
+    agent_jwt = sess["agent_token"]
+    agent_claims = _verify_or_401(agent_jwt)
+    umask = _umask_from_claims(agent_claims)
+
+    with run_with_identity(user_id=agent_claims["sub"], actor_id=agent_claims["act"]["sub"], umask=umask) as conn:
+        rows = call_tool("list_my_transactions", conn, {})
+
+    # Flatten the nested `act` purely for display; the JWT claim itself
+    # (newest actor outermost) is already the source of truth.
+    chain = []
+    node = agent_claims.get("act")
+    while node is not None:
+        chain.append(node.get("sub"))
+        node = node.get("act")
+
+    response = JSONResponse({
+        "action": "delegation_chain",
+        "chain": chain,
+        "agent_token_claims": {
+            "sub": agent_claims.get("sub"),
+            "act": agent_claims.get("act"),
+            "scope": agent_claims.get("scope"),
+            "umask": umask,
+        },
+        "rows": rows,
+    })
+    _set_session_cookie(response, sess)
+    return response
+
+
+# ----------------------------------------------------------------------------
 # Copilot: write (will be blocked by RLS - that's the demo)
 # ----------------------------------------------------------------------------
 @router.post("/action/copilot-write")

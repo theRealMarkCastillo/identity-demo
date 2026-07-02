@@ -126,7 +126,7 @@ psql -h localhost -p 54321 -U app_session -d identity -c \
 # (set app.user_id, app.actor_id, app.unmask_level first if you want to test specific paths)
 ```
 
-If the web-app container was rebuilt recently, the dashboard should already show **7 demo buttons** under "One-Click Demos": Human: Read Own, Human: Update Row, Copilot: Read Own, Copilot: Full Clearance Attempt, Copilot: Try Update, Masking: Side-by-Side Diff, plus Headless.
+If the web-app container was rebuilt recently, the dashboard should already show **8 demo buttons** under "One-Click Demos": Human: Read Own, Human: Update Row, Copilot: Read Own, Copilot: Full Clearance Attempt, Copilot: Try Update, Chain: 3-Hop Delegation, Masking: Side-by-Side Diff, plus Headless.
 
 ### Demo 1: Human Direct (1 min)
 
@@ -225,6 +225,17 @@ This demo reinforces the principal-type floor with visible "evidence":
    > "The user is in control. They killed the agent's authority mid-conversation. The agent can't do anything until the user re-delegates."
 
 > **If asked "what happened behind the scenes?"** → Run: `psql ... -c "SELECT jti, sub, act_sub, revoked, revoked_at FROM platform.token_records WHERE act_sub='agent_copilot_99' ORDER BY created_at DESC LIMIT 3;"`. Show the row's `revoked=TRUE`. "The web app checked this on every request, saw the revoke, returned 401. The LLM got back an error and surfaced it to the user."
+
+### Demo 2d: Multi-Hop Delegation Chain (1 min)
+
+1. Click **Chain: 3-Hop Delegation**
+2. The response shows a `chain` array: `["browser_browser_agent", "research_specialist", "orchestrator_main"]`, and the **Agent JWT** panel now has a *nested* `act` claim — `act.sub` is the current actor, `act.act.sub` is who delegated to them, and so on back to the user.
+   > "This isn't the web-app delegating to one agent — it's the web-app delegating to an orchestrator, which delegates to a specialist, which delegates to a tool-calling agent. Three RFC 8693 token exchanges, each one minted by whoever currently holds the authority. `orchestrator_main` and `research_specialist` each used their own client credentials to extend the chain — they couldn't have minted a delegation naming an unrelated actor; that's the confused-deputy check."
+3. Note `umask: masked` on the final hop, same as any other agent — the principal-type floor doesn't care how many hops deep you are.
+   > "Depth doesn't buy an agent anything. Every hop is still evaluated against the same floor, the same Cedar gate, the same scope intersection."
+
+> **If asked "why cap the depth?"** → "Unbounded chains are an unbounded audit trail and an unbounded blast radius if one hop is compromised. `MAX_DELEGATION_DEPTH` (default 4, `CP_MAX_DELEGATION_DEPTH`) bounds both. See ARCHITECTURE.md §9 FAQ and `control-plane/app/routes/token.py:_grant_token_exchange`."
+> **If asked "what stops one agent from reading another agent's chain and re-using its token?"** → "It can't extend a chain it isn't currently the actor in — checked via `subject_claims.act.sub == calling_client_id` — and revoking any one hop (`cli-admin token revoke-all --actor <agent_id>`) kills that token *and* blocks it from being exchanged for a new one, so a stolen mid-chain token can't be laundered into a fresh, live delegation either."
 
 ### Demo 3: Headless Agent (2 min)
 
@@ -358,6 +369,7 @@ make admin ARGS="token list --sub user_123"
 make admin ARGS="token revoke <jti>"
 make admin ARGS="token revoke-all --sub user_456"
 make admin ARGS="token revoke-all --client-id web-app"
+make admin ARGS="token revoke-all --actor research_specialist"   # every token this agent is/was any hop in
 
 # Column masking policies (data lives in platform.column_policies)
 make admin ARGS="column-policy list"

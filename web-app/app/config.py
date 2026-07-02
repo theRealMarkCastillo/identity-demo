@@ -30,6 +30,13 @@ class Config:
     CLIENT_SECRET = _required("WEB_APP_CLIENT_SECRET")
     REDIRECT_URI = _optional("WEB_APP_REDIRECT_URI", "http://localhost:13000/callback")
 
+    # Delegation-chain demo agents (orchestrator_main -> research_specialist).
+    # The web-app authenticates AS these agents to extend a chain it already
+    # started -- same shape as the CLI/test suite, just triggered from a
+    # dashboard button instead of curl.
+    ORCHESTRATOR_AGENT_SECRET = _optional("ORCHESTRATOR_AGENT_SECRET", "")
+    SPECIALIST_AGENT_SECRET = _optional("SPECIALIST_AGENT_SECRET", "")
+
     # Session + CSRF
     SESSION_SECRET = _required("WEB_APP_SESSION_SECRET")
     CSRF_SECRET = _required("FLASK_SECRET")

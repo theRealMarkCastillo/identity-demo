@@ -288,14 +288,25 @@ def cmd_token_revoke(args):
 def cmd_token_revoke_all(args):
     clauses = []
     params = []
+    filters = {}
     if args.sub:
         clauses.append("sub = %s")
         params.append(args.sub)
+        filters["sub"] = args.sub
     if args.client_id:
         clauses.append("client_id = %s")
         params.append(args.client_id)
+        filters["client_id"] = args.client_id
+    if args.actor:
+        # Matches the current actor (act_sub) OR any prior hop recorded in
+        # act_chain -- "kill every token that passed through this agent,"
+        # not just the ones where it's currently acting.
+        clauses.append("(act_sub = %s OR act_chain ? %s)")
+        params.append(args.actor)
+        params.append(args.actor)
+        filters["actor"] = args.actor
     if not clauses:
-        print("ERROR: must specify --sub or --client-id (refusing to revoke all tokens)")
+        print("ERROR: must specify --sub, --client-id, or --actor (refusing to revoke all tokens)")
         sys.exit(1)
     with _conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -303,7 +314,7 @@ def cmd_token_revoke_all(args):
             params,
         )
         count = cur.rowcount
-        _audit(cur, "admin_token_revoke_all", {"filters": dict(zip(['sub', 'client_id'], params)), "count": count})
+        _audit(cur, "admin_token_revoke_all", {"filters": filters, "count": count})
         conn.commit()
     print(f"Revoked {count} token(s)")
 
@@ -530,6 +541,7 @@ def build_parser() -> argparse.ArgumentParser:
     ptra = pts.add_parser("revoke-all", help="revoke all tokens matching a filter")
     ptra.add_argument("--sub")
     ptra.add_argument("--client-id")
+    ptra.add_argument("--actor", help="revoke tokens where this agent is or was any hop in the delegation chain")
     ptra.set_defaults(func=cmd_token_revoke_all)
 
     return p

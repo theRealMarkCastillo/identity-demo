@@ -51,6 +51,7 @@ export ADMIN_DB_USER=control_plane_admin   # default; superuser for write access
 ./admin.py token revoke <jti>
 ./admin.py token revoke-all --sub user_456
 ./admin.py token revoke-all --client-id web-app
+./admin.py token revoke-all --actor research_specialist   # kill every token where this agent is/was any hop in the chain
 ```
 
 ## How it works

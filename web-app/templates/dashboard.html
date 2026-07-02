@@ -90,6 +90,8 @@
       <button onclick="runAction('copilot-read')">Copilot: Read Own</button>
       <button onclick="runAction('copilot-full')">Copilot: Full Clearance Attempt</button>
       <button onclick="runAction('copilot-write')">Copilot: Try Update</button>
+      <div style="margin-top: 10px; margin-bottom: 6px; color: #94a3b8; font-size: 11px;">Multi-hop delegation (you → orchestrator → specialist → tool agent)</div>
+      <button onclick="runAction('delegation-chain')">Chain: 3-Hop Delegation</button>
       <div style="margin-top: 10px; margin-bottom: 6px; color: #94a3b8; font-size: 11px;">Redaction / masking demos</div>
       <button onclick="runAction('masking-comparison')">Masking: Side-by-Side Diff</button>
       <div style="margin-top: 10px; margin-bottom: 6px; color: #94a3b8; font-size: 11px;">Headless</div>
@@ -196,7 +198,7 @@
         if (name === "masking-comparison") {
           renderComparison(r);
         } else {
-          if (name === "copilot-read" || name === "headless" || name === "human-read") {
+          if (name === "copilot-read" || name === "headless" || name === "human-read" || name === "delegation-chain") {
             r.outcome = r.rows || r.outcome;
           }
           out.textContent = JSON.stringify(r, null, 2);
