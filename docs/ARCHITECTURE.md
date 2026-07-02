@@ -1216,6 +1216,18 @@ The swap-out is mostly configuration: point the web app at the IDP's issuer URL,
 5. **Database schema stays identical.** The web app still does `SET LOCAL app.user_id, app.actor_id` before each query. RLS still enforces row + principal type. The audit log still distinguishes principal from actor.
 6. **Token verification stays identical.** The web app fetches the IDP's JWKS (same URL pattern, different issuer) and runs the same RS256 verification. Nothing else changes.
 
+### Concrete migration: custom → Auth0
+
+Auth0 is the closer analogue to this demo's own scenario than Okta proper — Okta (the original product) targets workforce/employee identity, while Auth0 (same parent company since a 2021 acquisition, kept as a separate product) targets exactly this demo's shape: your own app's end users, with your own login and delegation logic.
+
+1. **In Auth0**: create a Regular Web Application for the web-app (Authorization Code + PKCE is on by default). Create a Machine-to-Machine application for the headless agent (Client Credentials grant).
+2. **In Auth0**: enable **Custom Token Exchange (CTE)** on the tenant and define a Token Exchange Profile that maps a `subject_token_type` to a validation Action. That Action is where you'd port `_grant_token_exchange`'s logic — verify the subject token, look up the agent, run the confused-deputy and depth-cap checks, decide the effective scope and `umask`.
+3. **In the web app**: change `OIDC_ISSUER` from the control plane to `https://your-tenant.auth0.com/`. Same PKCE- and token-exchange-aware client code, different issuer.
+4. **Role mapping**: an Auth0 Action on the login/token-issuance pipeline can inject role/scope claims from user metadata (or an external call), replacing `platform.role_scopes`.
+5. **Database, RLS, and audit log stay identical** — same as the Okta migration above.
+
+**Don't confuse this with Auth0's "Token Vault" feature.** Token Vault is a different, newer product for a different sub-problem: storing and exchanging tokens so an agent can call *third-party* APIs on a user's behalf (e.g., an agent reading the user's Google Calendar). It's marketed heavily toward AI agents, which makes it an easy trap to reach for by name, but its own documentation doesn't confirm it materializes an `act` claim, narrows scope per hop, or supports chains — it's not what replaces this demo's control plane. **Custom Token Exchange** is the RFC 8693 mechanism that does.
+
 ### RFC 8693 support by IDP — does delegation work?
 
 Not every IDP supports token exchange. This matters because RFC 8693 is what enables the delegated-agent story.
@@ -1223,9 +1235,10 @@ Not every IDP supports token exchange. This matters because RFC 8693 is what ena
 | IDP | RFC 8693 support | Notes |
 |---|---|---|
 | **Okta** | ✅ Yes (v1 API, `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`) | Best-supported major vendor; rich policy controls on which actors can be delegated to |
-| **Auth0** | ✅ Yes | Supports all token types (access, refresh, JWT); configurable per-client |
+| **Auth0** | ✅ Yes, via **Custom Token Exchange (CTE)** on `/oauth/token` | Developer-controlled validation logic (an Action), not a fixed policy — closest analogue to this demo's own `_grant_token_exchange`. Don't confuse with Auth0's separate "Token Vault" feature (see above) |
 | **Keycloak** | ✅ Yes | Native, configurable token-exchange flow with permission-based policies |
-| **Azure AD / Entra ID** | ⚠️ Partial | Microsoft's preferred delegation model is **On-Behalf-Of (OBO)**. RFC 8693 added more recently — verify the version |
+| **Azure AD / Entra ID (classic app registrations)** | ⚠️ Different model, not RFC 8693 | Delegation is **On-Behalf-Of (OBO)** — a different grant type (`urn:ietf:params:oauth:grant-type:jwt-bearer`) and claim shape, not the token-exchange grant. See below |
+| **Microsoft Entra Agent ID** (2026, agent-specific) | N/A — different category of product | Not a token-exchange mechanism at all; an identity *governance* platform. See below |
 | **AWS Cognito** | ❌ No native support | Would need a custom broker service in front |
 | **Google Cloud IAM** | ❌ No | Uses Workload Identity Federation (OIDC token → GCP access token) instead — different model |
 | **HashiCorp Vault** | ⚠️ Limited | Vault issues tokens, but its model isn't a drop-in OAuth 2.1 server |
@@ -1234,6 +1247,15 @@ Not every IDP supports token exchange. This matters because RFC 8693 is what ena
 
 1. **Stand up a thin token-exchange broker** — the `control-plane/` from this demo, scaled down to ~150 lines of code, in front of the IDP. It accepts the user's IDP-issued token + an actor claim, mints a delegated JWT with the `act` claim, and signs with its own key. The rest of the architecture (web app, RLS, GUCs, audit log) is completely unchanged.
 2. **Use the IDP's native delegation model.** Azure's OBO flow encodes delegation differently, but the `sub` + scope + audit story still works — you'd translate OBO claims into the same `app.user_id` / `app.actor_id` GUC pattern.
+
+### Microsoft Entra: two different things, neither a drop-in swap
+
+Microsoft's identity story splits into two products that are easy to conflate, and neither maps onto the simple "change the issuer URL" swap Okta and Auth0 do:
+
+1. **Classic Azure AD / Entra ID app registrations** support delegation via **On-Behalf-Of (OBO)**, not RFC 8693. OBO carries the same intent (a downstream service acts using a caller's delegated identity) but is a different grant type and claim shape. Adopting it means translating OBO's claims into this demo's `app.user_id` / `app.actor_id` GUC pattern at the web-app layer, not reusing the `act` claim verbatim.
+2. **Microsoft Entra Agent ID** (2026) is a separate, newer, agent-specific product — and it isn't primarily a token-issuance mechanism at all. It's an identity *governance* platform: agents (including ones built on non-Microsoft platforms, integrated via the Entra Auth SDK sidecar or workload identity federation) get identity accounts inside your Entra tenant, with conditional access, risk detection, and lifecycle management layered on top. It requires being an Entra tenant customer with specific licensing (Entra ID P1/P2, or Microsoft 365 E5/E7 plus a Microsoft Agent 365 license). Adopting it replaces more than this demo's control plane — it replaces the *governance* layer this demo deliberately doesn't attempt to build (no policy versioning, no lifecycle management, no conditional access — see §13).
+
+**Bottom line:** Okta and Auth0 are close to drop-in replacements for this demo's control plane, because both are plain OIDC providers with RFC 8693 support. Entra Agent ID is a different category of tool — a governance platform, not just an authorization server — and adopting it is a bigger decision than swapping an issuer URL.
 
 ### What you gain from the swap
 
