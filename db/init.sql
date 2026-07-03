@@ -126,16 +126,24 @@ CREATE TABLE platform.agents (
   agent_id        TEXT PRIMARY KEY,
   description     TEXT,
   default_scopes  TEXT[] NOT NULL,
-  is_delegatable  BOOLEAN NOT NULL
+  is_delegatable  BOOLEAN NOT NULL,
+  -- Who's accountable for this agent existing and having these scopes --
+  -- NOT who acted in a given request (that's act.sub on the JWT). This is
+  -- provisioning-time accountability, not request-time identity. Deliberately
+  -- just a pointer, not a managed relationship: no expiry, no transfer-on-
+  -- departure, no notifications. That's identity-governance-platform territory
+  -- (see ARCHITECTURE.md §13 and Entra Agent ID's "Sponsor" concept for what a
+  -- real implementation of that layer looks like) -- out of scope here.
+  owner_user_id   TEXT NOT NULL REFERENCES platform.users(user_id)
 );
 
 INSERT INTO platform.agents VALUES
-  ('agent_copilot_99',  'Analyst copilot (UI-delegatable)', ARRAY['read:transactions','read:transactions.full'], TRUE),
-  ('agent_etl_nightly', 'Nightly ETL monitor (headless)',   ARRAY['read:transactions'], FALSE),
+  ('agent_copilot_99',  'Analyst copilot (UI-delegatable)', ARRAY['read:transactions','read:transactions.full'], TRUE, 'user_123'),
+  ('agent_etl_nightly', 'Nightly ETL monitor (headless)',   ARRAY['read:transactions'], FALSE, 'user_123'),
   -- Demo chain for nested delegation: user -> orchestrator -> specialist -> browser tool.
-  ('orchestrator_main',      'Orchestrator agent (first hop of a delegation chain)',  ARRAY['read:transactions'], TRUE),
-  ('research_specialist',    'Specialist agent (second hop, delegated by orchestrator)', ARRAY['read:transactions'], TRUE),
-  ('browser_browser_agent',  'Browser tool agent (chain leaf, third hop)',            ARRAY['read:transactions'], TRUE);
+  ('orchestrator_main',      'Orchestrator agent (first hop of a delegation chain)',  ARRAY['read:transactions'], TRUE, 'user_123'),
+  ('research_specialist',    'Specialist agent (second hop, delegated by orchestrator)', ARRAY['read:transactions'], TRUE, 'user_123'),
+  ('browser_browser_agent',  'Browser tool agent (chain leaf, third hop)',            ARRAY['read:transactions'], TRUE, 'user_123');
 
 GRANT SELECT ON platform.agents TO app_session;
 

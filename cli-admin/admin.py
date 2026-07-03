@@ -8,12 +8,13 @@ Usage:
     cli-admin role add contractor "Read access to own rows"
     cli-admin role grant contractor read:transactions
     cli-admin agent list
-    cli-admin agent add agent_data_analyst --scopes read:transactions --delegatable
+    cli-admin agent add agent_data_analyst --scopes read:transactions --owner user_123 --delegatable
     cli-admin client list
     cli-admin token list --active-only
     cli-admin token revoke <jti>
 """
 import argparse
+import getpass
 import json
 import os
 import secrets
@@ -39,12 +40,24 @@ def _conn():
     return psycopg.connect(_dsn())
 
 
+def _operator() -> str:
+    """Who is actually running this command.
+
+    Was hardcoded to the literal string "cli-admin" for every invocation,
+    which meant the one audit trail a human IS present for (provisioning)
+    couldn't say which human. CLI_ADMIN_OPERATOR overrides for cases where
+    the OS login isn't meaningful (shared/CI credentials); otherwise falls
+    back to the actual OS user running the command.
+    """
+    return os.environ.get("CLI_ADMIN_OPERATOR") or getpass.getuser()
+
+
 def _audit(cur, event_type: str, details: dict) -> None:
     """Write to platform.audit_log. Every admin action is auditable."""
     cur.execute(
         "INSERT INTO platform.audit_log (event_type, sub, result, details) "
         "VALUES (%s, %s, %s, %s)",
-        (event_type, "cli-admin", "success", json.dumps(details)),
+        (event_type, _operator(), "success", json.dumps(details)),
     )
 
 
@@ -124,7 +137,7 @@ def cmd_role_delete(args):
 def cmd_agent_list(args):
     with _conn() as conn, conn.cursor(row_factory=dict_row) as cur:
         cur.execute("""
-            SELECT agent_id, description, default_scopes, is_delegatable
+            SELECT agent_id, description, default_scopes, is_delegatable, owner_user_id
             FROM platform.agents
             ORDER BY agent_id
         """)
@@ -132,32 +145,34 @@ def cmd_agent_list(args):
     if not rows:
         print("(no agents registered)")
         return
-    print(f"{'AGENT ID':<25} {'DELEGATABLE':<12} DEFAULT SCOPES")
+    print(f"{'AGENT ID':<25} {'DELEGATABLE':<12} {'OWNER':<12} DEFAULT SCOPES")
     print("-" * 100)
     for r in rows:
         d = "yes" if r["is_delegatable"] else "no"
-        print(f"{r['agent_id']:<25} {d:<12} {', '.join(r['default_scopes'])}")
+        print(f"{r['agent_id']:<25} {d:<12} {r['owner_user_id']:<12} {', '.join(r['default_scopes'])}")
 
 
 def cmd_agent_add(args):
     scopes = [s.strip() for s in args.scopes.split(",") if s.strip()]
     with _conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO platform.agents (agent_id, description, default_scopes, is_delegatable) "
-            "VALUES (%s, %s, %s, %s) "
+            "INSERT INTO platform.agents (agent_id, description, default_scopes, is_delegatable, owner_user_id) "
+            "VALUES (%s, %s, %s, %s, %s) "
             "ON CONFLICT (agent_id) DO UPDATE SET "
             "  description = EXCLUDED.description, "
             "  default_scopes = EXCLUDED.default_scopes, "
-            "  is_delegatable = EXCLUDED.is_delegatable",
-            (args.agent_id, args.description or "", scopes, args.delegatable),
+            "  is_delegatable = EXCLUDED.is_delegatable, "
+            "  owner_user_id = EXCLUDED.owner_user_id",
+            (args.agent_id, args.description or "", scopes, args.delegatable, args.owner),
         )
         _audit(cur, "admin_agent_add", {
             "agent_id": args.agent_id,
             "default_scopes": scopes,
             "is_delegatable": args.delegatable,
+            "owner_user_id": args.owner,
         })
         conn.commit()
-    print(f"Added agent '{args.agent_id}' (scopes={scopes}, delegatable={args.delegatable})")
+    print(f"Added agent '{args.agent_id}' (scopes={scopes}, delegatable={args.delegatable}, owner={args.owner})")
 
 
 def cmd_agent_update(args):
@@ -480,6 +495,7 @@ def build_parser() -> argparse.ArgumentParser:
     paa.add_argument("agent_id")
     paa.add_argument("--description", default="")
     paa.add_argument("--scopes", required=True, help="comma-separated default scopes")
+    paa.add_argument("--owner", required=True, help="user_id accountable for this agent existing and having these scopes (not who acted in a given request -- see ARCHITECTURE.md #13)")
     paa.add_argument("--delegatable", action="store_true", default=True, help="can be delegated to (default)")
     paa.add_argument("--no-delegatable", action="store_false", dest="delegatable")
     paa.set_defaults(func=cmd_agent_add)

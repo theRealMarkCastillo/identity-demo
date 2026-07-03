@@ -355,7 +355,7 @@ make admin ARGS="role delete contractor"
 
 # Agents
 make admin ARGS="agent list"
-make admin ARGS="agent add agent_data_analyst --scopes read:transactions --delegatable"
+make admin ARGS="agent add agent_data_analyst --scopes read:transactions --owner user_123 --delegatable"
 make admin ARGS="agent update agent_data_analyst --scopes read:transactions,read:reports"
 make admin ARGS="agent delete agent_data_analyst"
 

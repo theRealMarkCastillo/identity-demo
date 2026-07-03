@@ -38,9 +38,11 @@ This uses `mermaid.parse()` in bare Node without a DOM, which cannot validate `f
 **Admin CLI** (direct DB writes, bypasses the control plane's own API):
 ```bash
 make admin ARGS="agent list"
-make admin ARGS="agent add <id> --description '...' --scopes read:transactions --delegatable"
+make admin ARGS="agent add <id> --description '...' --scopes read:transactions --owner <user_id> --delegatable"
 ```
 `agent add` only inserts into `platform.agents` — it makes the agent a valid delegation *target* but does not register OAuth client credentials for it, so it can never itself call `/oauth/token` to extend a delegation chain. For that it also needs a `platform.clients` row (see `orchestrator_main` / `research_specialist` in `db/init.sql` for the pattern: `client_type='agent'`, its own bcrypt-hashed secret).
+
+`--owner` is required and records who's accountable for the agent existing and having its scopes — provisioning-time accountability, not request-time identity (that's `act.sub` on the JWT, unrelated). It's deliberately just a pointer, not a managed relationship: no expiry, no transfer-on-departure, no notifications. See `docs/ARCHITECTURE.md` §13 for why that fuller lifecycle-governance layer (Entra Agent ID's "Sponsor" concept is the reference example) is out of scope here.
 
 ## Architecture
 

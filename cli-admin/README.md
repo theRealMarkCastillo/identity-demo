@@ -29,9 +29,17 @@ export ADMIN_DB_USER=control_plane_admin   # default; superuser for write access
 ./admin.py agent add agent_data_analyst \
     --description "Read-only data analyst agent" \
     --scopes read:transactions \
+    --owner user_123 \
     --delegatable
 ./admin.py agent update agent_data_analyst --scopes read:transactions,read:reports
 ./admin.py agent delete agent_data_analyst
+# NOTE: --owner is required -- it's who's accountable for this agent existing
+# and having these scopes, not who acted in a given request (that's act.sub
+# on the JWT, set at token-exchange time, unrelated). It's just a pointer, not
+# a managed relationship: no expiry, no transfer-on-departure, no
+# notifications. See ARCHITECTURE.md #13 for why that's deliberately out of
+# scope here (Entra Agent ID's "Sponsor" concept is the reference example of
+# what a full implementation of that layer looks like).
 # NOTE: `agent add` only inserts into platform.agents. That makes the agent a
 # valid delegation TARGET (something you can delegate to), but it can't
 # itself extend a delegation chain further -- for that it also needs a

@@ -421,6 +421,7 @@ def _drive_admin(c: httpx.Client):
     # 3. Add an agent
     rc, _, _ = cli_admin("agent", "add", "qa_agent",
                          "--scopes", "read:transactions",
+                         "--owner", "user_123",
                          "--delegatable")
     assert_eq("cli-admin agent add rc", rc, 0)
     d = list_admin()

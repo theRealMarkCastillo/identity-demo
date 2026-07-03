@@ -44,12 +44,12 @@ def admin_dashboard(request: Request):
 
         # Agents
         cur.execute("""
-            SELECT agent_id, description, default_scopes, is_delegatable
+            SELECT agent_id, description, default_scopes, is_delegatable, owner_user_id
             FROM platform.agents
             ORDER BY agent_id
         """)
         agents = [
-            {"agent_id": r[0], "description": r[1], "default_scopes": r[2], "is_delegatable": r[3]}
+            {"agent_id": r[0], "description": r[1], "default_scopes": r[2], "is_delegatable": r[3], "owner_user_id": r[4]}
             for r in cur.fetchall()
         ]
 
@@ -161,12 +161,12 @@ def _collect_admin_data() -> dict:
         roles = [{"role": r[0], "description": r[1], "scopes": r[2]} for r in cur.fetchall()]
 
         cur.execute("""
-            SELECT agent_id, description, default_scopes, is_delegatable
+            SELECT agent_id, description, default_scopes, is_delegatable, owner_user_id
             FROM platform.agents
             ORDER BY agent_id
         """)
         agents = [
-            {"agent_id": r[0], "description": r[1], "default_scopes": r[2], "is_delegatable": r[3]}
+            {"agent_id": r[0], "description": r[1], "default_scopes": r[2], "is_delegatable": r[3], "owner_user_id": r[4]}
             for r in cur.fetchall()
         ]
 
