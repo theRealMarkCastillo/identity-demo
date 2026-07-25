@@ -24,6 +24,21 @@
   "session_metrics": {
     "turn_count": 1
   },
+  "summary": {
+    "intent": "Create a marker file documenting that the repository is the user's first Entire checkpoint demo and commit it to version control.",
+    "outcome": "Created `hello-entire.md` and successfully committed it as `655cd98` with message \"Add hello-entire.md checkpoint note\".",
+    "learnings": {
+      "repo": [
+        "Repository is `identity-demo`, designated as the user's first Entire checkpoint demo."
+      ],
+      "code": [],
+      "workflow": [
+        "Followed safe pre-commit inspection pattern: `git status` + `git diff` to review changes, then `git log --oneline -5` for recent context, before staging and committing."
+      ]
+    },
+    "friction": [],
+    "open_items": []
+  },
   "initial_attribution": {
     "calculated_at": "2026-07-25T18:19:39.722454Z",
     "agent_lines": 3,
