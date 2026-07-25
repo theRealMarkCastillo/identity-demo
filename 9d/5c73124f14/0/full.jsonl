@@ -17,19 +17,19 @@
       "deletions": 0,
       "files": 0
     },
-    "cost": 0.00464377,
+    "cost": 0.004996845000000001,
     "tokens": {
-      "input": 9990,
-      "output": 193,
-      "reasoning": 67,
+      "input": 10309,
+      "output": 274,
+      "reasoning": 147,
       "cache": {
-        "read": 19840,
+        "read": 40320,
         "write": 0
       }
     },
     "time": {
       "created": 1785003526133,
-      "updated": 1785003575796
+      "updated": 1785003579870
     }
   },
   "messages": [
@@ -416,21 +416,24 @@
           "cwd": "/Users/markcastillo/git/identity-demo",
           "root": "/Users/markcastillo/git/identity-demo"
         },
-        "cost": 0,
+        "cost": 0.000236321,
         "tokens": {
-          "input": 0,
-          "output": 0,
-          "reasoning": 0,
+          "total": 10441,
+          "input": 199,
+          "output": 62,
+          "reasoning": 68,
           "cache": {
-            "read": 0,
-            "write": 0
+            "write": 0,
+            "read": 10112
           }
         },
         "modelID": "deepseek-v4-pro",
         "providerID": "deepseek",
         "time": {
-          "created": 1785003575795
+          "created": 1785003575795,
+          "completed": 1785003579867
         },
+        "finish": "tool-calls",
         "id": "msg_f9a8109f3001T4LODqkIkyHupV",
         "sessionID": "ses_0657fb80affelxzJWmuphHdR1e"
       },
@@ -458,20 +461,126 @@
           "tool": "bash",
           "callID": "call_00_FEEg9uMUTJHB5Xf6isby5307",
           "state": {
-            "metadata": {
-              "output": ""
-            },
-            "status": "running",
+            "status": "completed",
             "input": {
               "command": "git add hello-entire.md && git commit -m \"Add hello-entire.md checkpoint note\""
             },
+            "output": "[main 655cd98] Add hello-entire.md checkpoint note\n 1 file changed, 3 insertions(+)\n create mode 100644 hello-entire.md\n",
+            "metadata": {
+              "output": "[main 655cd98] Add hello-entire.md checkpoint note\n 1 file changed, 3 insertions(+)\n create mode 100644 hello-entire.md\n",
+              "exit": 0,
+              "truncated": false
+            },
+            "title": "git add hello-entire.md && git commit -m \"Add hello-entire.md checkpoint note\"",
             "time": {
-              "start": 1785003578403
+              "start": 1785003579753,
+              "end": 1785003579755
             }
           },
           "id": "prt_f9a8112ca001IF3yBKyBnXRQ6w",
           "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
           "messageID": "msg_f9a8109f3001T4LODqkIkyHupV"
+        },
+        {
+          "reason": "tool-calls",
+          "snapshot": "1794cf8ef751903f29b75b13607cf43ddba42575",
+          "type": "step-finish",
+          "tokens": {
+            "total": 10441,
+            "input": 199,
+            "output": 62,
+            "reasoning": 68,
+            "cache": {
+              "write": 0,
+              "read": 10112
+            }
+          },
+          "cost": 0.000236321,
+          "id": "prt_f9a8119a3001dDNjj8ecss82KB",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a8109f3001T4LODqkIkyHupV"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_f9a80fbfe001H52kYwBy7GwNLJ",
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "path": {
+          "cwd": "/Users/markcastillo/git/identity-demo",
+          "root": "/Users/markcastillo/git/identity-demo"
+        },
+        "cost": 0.000116754,
+        "tokens": {
+          "total": 10519,
+          "input": 120,
+          "output": 19,
+          "reasoning": 12,
+          "cache": {
+            "write": 0,
+            "read": 10368
+          }
+        },
+        "modelID": "deepseek-v4-pro",
+        "providerID": "deepseek",
+        "time": {
+          "created": 1785003579869,
+          "completed": 1785003581726
+        },
+        "finish": "stop",
+        "id": "msg_f9a8119dd001nvgoV5oIWI06vk",
+        "sessionID": "ses_0657fb80affelxzJWmuphHdR1e"
+      },
+      "parts": [
+        {
+          "snapshot": "1794cf8ef751903f29b75b13607cf43ddba42575",
+          "type": "step-start",
+          "id": "prt_f9a811ce3001GIibeDNF13SPyS",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a8119dd001nvgoV5oIWI06vk"
+        },
+        {
+          "type": "reasoning",
+          "text": "Done. Committed on main as 655cd98.",
+          "time": {
+            "start": 1785003581149,
+            "end": 1785003581476
+          },
+          "id": "prt_f9a811edd001rVvlN1pPFKoIoN",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a8119dd001nvgoV5oIWI06vk"
+        },
+        {
+          "type": "text",
+          "text": "Committed as `655cd98` — `Add hello-entire.md checkpoint note`.",
+          "time": {
+            "start": 1785003581478,
+            "end": 1785003581604
+          },
+          "id": "prt_f9a812025001p5CQBQ2EP9JhmI",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a8119dd001nvgoV5oIWI06vk"
+        },
+        {
+          "reason": "stop",
+          "snapshot": "1794cf8ef751903f29b75b13607cf43ddba42575",
+          "type": "step-finish",
+          "tokens": {
+            "total": 10519,
+            "input": 120,
+            "output": 19,
+            "reasoning": 12,
+            "cache": {
+              "write": 0,
+              "read": 10368
+            }
+          },
+          "cost": 0.000116754,
+          "id": "prt_f9a8120e7001h3A4VWBZUrromD",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a8119dd001nvgoV5oIWI06vk"
         }
       ]
     }
