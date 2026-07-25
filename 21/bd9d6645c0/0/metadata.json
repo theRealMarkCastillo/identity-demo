@@ -25,6 +25,19 @@
   "session_metrics": {
     "turn_count": 2
   },
+  "summary": {
+    "intent": "Create a second hello checkpoint file in the identity-demo repo and commit it to continue a series of hello files.",
+    "outcome": "Created hello-entire-2.md and committed it as a955dfd with message 'Add second hello-entire checkpoint'.",
+    "learnings": {
+      "repo": [
+        "Repo appears to follow a convention of numbered 'hello-entire' checkpoint files (hello-entire-2.md suggests a hello-entire-1.md or similar exists)."
+      ],
+      "code": [],
+      "workflow": []
+    },
+    "friction": [],
+    "open_items": []
+  },
   "initial_attribution": {
     "calculated_at": "2026-07-25T18:35:33.948831Z",
     "agent_lines": 3,
