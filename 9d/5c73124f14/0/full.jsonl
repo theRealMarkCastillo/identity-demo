@@ -1,0 +1,479 @@
+{
+  "info": {
+    "id": "ses_0657fb80affelxzJWmuphHdR1e",
+    "slug": "curious-cabin",
+    "projectID": "36bc5f481af837cb1d14904193a7142a4753d2b6",
+    "directory": "/Users/markcastillo/git/identity-demo",
+    "path": "",
+    "title": "hello-entire.md for first Entire checkpoint",
+    "agent": "build",
+    "model": {
+      "id": "deepseek-v4-pro",
+      "providerID": "deepseek"
+    },
+    "version": "1.18.3",
+    "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+    },
+    "cost": 0.00464377,
+    "tokens": {
+      "input": 9990,
+      "output": 193,
+      "reasoning": 67,
+      "cache": {
+        "read": 19840,
+        "write": 0
+      }
+    },
+    "time": {
+      "created": 1785003526133,
+      "updated": 1785003575796
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1785003526146
+        },
+        "agent": "build",
+        "model": {
+          "providerID": "deepseek",
+          "modelID": "deepseek-v4-pro"
+        },
+        "summary": {
+          "diffs": [
+            {
+              "file": "hello-entire.md",
+              "patch": "Index: hello-entire.md\n===================================================================\n--- hello-entire.md\t\n+++ hello-entire.md\t\n@@ -0,0 +1,3 @@\n+# Hello Entire\n+\n+This repo is my first Entire checkpoint demo, proving that AI agent identity and authorization can be handled with real cryptographic rigor.\n",
+              "additions": 3,
+              "deletions": 0,
+              "status": "added"
+            }
+          ]
+        },
+        "id": "msg_f9a80480200180DQd2PVmBuw6k",
+        "sessionID": "ses_0657fb80affelxzJWmuphHdR1e"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "Create a file named hello-entire.md with a short note explaining that this repo is my first Entire checkpoint demo.",
+          "id": "prt_f9a804804001tLhERsG6UdUnMR",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a80480200180DQd2PVmBuw6k"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_f9a80480200180DQd2PVmBuw6k",
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "path": {
+          "cwd": "/Users/markcastillo/git/identity-demo",
+          "root": "/Users/markcastillo/git/identity-demo"
+        },
+        "cost": 0.004393935,
+        "tokens": {
+          "total": 9969,
+          "input": 9837,
+          "output": 103,
+          "reasoning": 29,
+          "cache": {
+            "write": 0,
+            "read": 0
+          }
+        },
+        "modelID": "deepseek-v4-pro",
+        "providerID": "deepseek",
+        "time": {
+          "created": 1785003526556,
+          "completed": 1785003529844
+        },
+        "finish": "tool-calls",
+        "id": "msg_f9a80499c001VzlwOAwJ8fHLeC",
+        "sessionID": "ses_0657fb80affelxzJWmuphHdR1e"
+      },
+      "parts": [
+        {
+          "snapshot": "7c5d5a89067da29d5b4c07e13c75e2fb4b049c88",
+          "type": "step-start",
+          "id": "prt_f9a804e2b001OS4ZKtFf1N3n7X",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a80499c001VzlwOAwJ8fHLeC"
+        },
+        {
+          "type": "reasoning",
+          "text": "The user wants me to create a file named `hello-entire.md` with a short note. Let me create it in the working directory.",
+          "time": {
+            "start": 1785003528266,
+            "end": 1785003528882
+          },
+          "id": "prt_f9a80504a001Ia4kKfl3jE1MCw",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a80499c001VzlwOAwJ8fHLeC"
+        },
+        {
+          "type": "tool",
+          "tool": "write",
+          "callID": "call_00_V7K1izieQbx80OJ7qF0N2939",
+          "state": {
+            "status": "completed",
+            "input": {
+              "filePath": "/Users/markcastillo/git/identity-demo/hello-entire.md",
+              "content": "# Hello Entire\n\nThis repo is my first Entire checkpoint demo, proving that AI agent identity and authorization can be handled with real cryptographic rigor.\n"
+            },
+            "output": "Wrote file successfully.",
+            "metadata": {
+              "diagnostics": {},
+              "filepath": "/Users/markcastillo/git/identity-demo/hello-entire.md",
+              "exists": false,
+              "truncated": false
+            },
+            "title": "hello-entire.md",
+            "time": {
+              "start": 1785003529589,
+              "end": 1785003529595
+            }
+          },
+          "id": "prt_f9a8052b4001jkrQ8Dh3Zzuu8o",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a80499c001VzlwOAwJ8fHLeC"
+        },
+        {
+          "reason": "tool-calls",
+          "snapshot": "1794cf8ef751903f29b75b13607cf43ddba42575",
+          "type": "step-finish",
+          "tokens": {
+            "total": 9969,
+            "input": 9837,
+            "output": 103,
+            "reasoning": 29,
+            "cache": {
+              "write": 0,
+              "read": 0
+            }
+          },
+          "cost": 0.004393935,
+          "id": "prt_f9a80562f001tKRbXrjHA99ABH",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a80499c001VzlwOAwJ8fHLeC"
+        },
+        {
+          "type": "patch",
+          "hash": "7c5d5a89067da29d5b4c07e13c75e2fb4b049c88",
+          "files": [
+            "/Users/markcastillo/git/identity-demo/hello-entire.md"
+          ],
+          "id": "prt_f9a805672001GdeBn4jXBGZqVF",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a80499c001VzlwOAwJ8fHLeC"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_f9a80480200180DQd2PVmBuw6k",
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "path": {
+          "cwd": "/Users/markcastillo/git/identity-demo",
+          "root": "/Users/markcastillo/git/identity-demo"
+        },
+        "cost": 0.000105763,
+        "tokens": {
+          "total": 10001,
+          "input": 129,
+          "output": 8,
+          "reasoning": 8,
+          "cache": {
+            "write": 0,
+            "read": 9856
+          }
+        },
+        "modelID": "deepseek-v4-pro",
+        "providerID": "deepseek",
+        "time": {
+          "created": 1785003529845,
+          "completed": 1785003531306
+        },
+        "finish": "stop",
+        "id": "msg_f9a805675001L4lfW3mJO8mFjC",
+        "sessionID": "ses_0657fb80affelxzJWmuphHdR1e"
+      },
+      "parts": [
+        {
+          "snapshot": "1794cf8ef751903f29b75b13607cf43ddba42575",
+          "type": "step-start",
+          "id": "prt_f9a8058c2001Kq75sW8XrgwOya",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a805675001L4lfW3mJO8mFjC"
+        },
+        {
+          "type": "reasoning",
+          "text": "Done. The file was created successfully.",
+          "time": {
+            "start": 1785003530924,
+            "end": 1785003531156
+          },
+          "id": "prt_f9a805aac001s1XrTcv2ElTHnC",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a805675001L4lfW3mJO8mFjC"
+        },
+        {
+          "type": "text",
+          "text": "Created `hello-entire.md`.",
+          "time": {
+            "start": 1785003531157,
+            "end": 1785003531199
+          },
+          "id": "prt_f9a805b95001whD0E9pcWKqWGi",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a805675001L4lfW3mJO8mFjC"
+        },
+        {
+          "reason": "stop",
+          "snapshot": "1794cf8ef751903f29b75b13607cf43ddba42575",
+          "type": "step-finish",
+          "tokens": {
+            "total": 10001,
+            "input": 129,
+            "output": 8,
+            "reasoning": 8,
+            "cache": {
+              "write": 0,
+              "read": 9856
+            }
+          },
+          "cost": 0.000105763,
+          "id": "prt_f9a805bf2001Q4LMZCiwSSdnX6",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a805675001L4lfW3mJO8mFjC"
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1785003572222
+        },
+        "agent": "build",
+        "model": {
+          "providerID": "deepseek",
+          "modelID": "deepseek-v4-pro"
+        },
+        "summary": {
+          "diffs": []
+        },
+        "id": "msg_f9a80fbfe001H52kYwBy7GwNLJ",
+        "sessionID": "ses_0657fb80affelxzJWmuphHdR1e"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "create git commit",
+          "id": "prt_f9a80fbff001cGpg6mymjS59BK",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a80fbfe001H52kYwBy7GwNLJ"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_f9a80fbfe001H52kYwBy7GwNLJ",
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "path": {
+          "cwd": "/Users/markcastillo/git/identity-demo",
+          "root": "/Users/markcastillo/git/identity-demo"
+        },
+        "cost": 0.000144072,
+        "tokens": {
+          "total": 10120,
+          "input": 24,
+          "output": 82,
+          "reasoning": 30,
+          "cache": {
+            "write": 0,
+            "read": 9984
+          }
+        },
+        "modelID": "deepseek-v4-pro",
+        "providerID": "deepseek",
+        "time": {
+          "created": 1785003572846,
+          "completed": 1785003575793
+        },
+        "finish": "tool-calls",
+        "id": "msg_f9a80fe6e001h7gp1DN6sJC0lU",
+        "sessionID": "ses_0657fb80affelxzJWmuphHdR1e"
+      },
+      "parts": [
+        {
+          "snapshot": "1794cf8ef751903f29b75b13607cf43ddba42575",
+          "type": "step-start",
+          "id": "prt_f9a8103890011qpYNFHFWukhWu",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a80fe6e001h7gp1DN6sJC0lU"
+        },
+        {
+          "type": "reasoning",
+          "text": "The user wants me to create a git commit. First, I need to check the git status to see what's changed, then stage and commit.",
+          "time": {
+            "start": 1785003574597,
+            "end": 1785003575067
+          },
+          "id": "prt_f9a8105440014xMbtWY0kn7CdO",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a80fe6e001h7gp1DN6sJC0lU"
+        },
+        {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_00_2OF9tx3oBFSxKDx8umSv5347",
+          "state": {
+            "status": "completed",
+            "input": {
+              "command": "git status && git diff"
+            },
+            "output": "On branch main\nYour branch is up to date with 'origin/main'.\n\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\t.entire/\n\t.opencode/\n\thello-entire.md\n\nnothing added to commit but untracked files present (use \"git add\" to track)\n",
+            "metadata": {
+              "output": "On branch main\nYour branch is up to date with 'origin/main'.\n\nUntracked files:\n  (use \"git add <file>...\" to include in what will be committed)\n\t.entire/\n\t.opencode/\n\thello-entire.md\n\nnothing added to commit but untracked files present (use \"git add\" to track)\n",
+              "exit": 0,
+              "truncated": false
+            },
+            "title": "git status && git diff",
+            "time": {
+              "start": 1785003575381,
+              "end": 1785003575392
+            }
+          },
+          "id": "prt_f9a810720001Y8I0Wzp1wHCsLU",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a80fe6e001h7gp1DN6sJC0lU"
+        },
+        {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_01_SnBfEZXBln3m1eKrJBwR6125",
+          "state": {
+            "status": "completed",
+            "input": {
+              "command": "git log --oneline -5"
+            },
+            "output": "78b0c8b Add agent ownership tracking, fix cli-admin audit-operator bug\n6a1e6d4 Document Auth0 and Entra migration paths in External IDP Integration\nbe0716d Fix doc/code drift found in full documentation review\n05ccc43 Add dashboard demo button for delegation chains, revoke-by-actor in cli-admin\n830ce9a Close revocation-propagation gap in token exchange, show act_chain in cli-admin\n",
+            "metadata": {
+              "output": "78b0c8b Add agent ownership tracking, fix cli-admin audit-operator bug\n6a1e6d4 Document Auth0 and Entra migration paths in External IDP Integration\nbe0716d Fix doc/code drift found in full documentation review\n05ccc43 Add dashboard demo button for delegation chains, revoke-by-actor in cli-admin\n830ce9a Close revocation-propagation gap in token exchange, show act_chain in cli-admin\n",
+              "exit": 0,
+              "truncated": false
+            },
+            "title": "git log --oneline -5",
+            "time": {
+              "start": 1785003575610,
+              "end": 1785003575611
+            }
+          },
+          "id": "prt_f9a810875001Ver4T3T369ADbK",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a80fe6e001h7gp1DN6sJC0lU"
+        },
+        {
+          "reason": "tool-calls",
+          "snapshot": "1794cf8ef751903f29b75b13607cf43ddba42575",
+          "type": "step-finish",
+          "tokens": {
+            "total": 10120,
+            "input": 24,
+            "output": 82,
+            "reasoning": 30,
+            "cache": {
+              "write": 0,
+              "read": 9984
+            }
+          },
+          "cost": 0.000144072,
+          "id": "prt_f9a8109b8001iAMTp6c5rFg8ZV",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a80fe6e001h7gp1DN6sJC0lU"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_f9a80fbfe001H52kYwBy7GwNLJ",
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "path": {
+          "cwd": "/Users/markcastillo/git/identity-demo",
+          "root": "/Users/markcastillo/git/identity-demo"
+        },
+        "cost": 0,
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "modelID": "deepseek-v4-pro",
+        "providerID": "deepseek",
+        "time": {
+          "created": 1785003575795
+        },
+        "id": "msg_f9a8109f3001T4LODqkIkyHupV",
+        "sessionID": "ses_0657fb80affelxzJWmuphHdR1e"
+      },
+      "parts": [
+        {
+          "snapshot": "1794cf8ef751903f29b75b13607cf43ddba42575",
+          "type": "step-start",
+          "id": "prt_f9a810c5f001050ddGGrtEpHg9",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a8109f3001T4LODqkIkyHupV"
+        },
+        {
+          "type": "reasoning",
+          "text": "The user wants to create a git commit for `hello-entire.md`. I should only stage that file, not the `.entire/` and `.opencode/` directories which appear to be related to opencode config and shouldn't be committed unless requested.\n\nLet me just stage and commit the `hello-entire.md` file.",
+          "time": {
+            "start": 1785003576950,
+            "end": 1785003578055
+          },
+          "id": "prt_f9a810e76001l0dtSRiTXq82QI",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a8109f3001T4LODqkIkyHupV"
+        },
+        {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_00_FEEg9uMUTJHB5Xf6isby5307",
+          "state": {
+            "metadata": {
+              "output": ""
+            },
+            "status": "running",
+            "input": {
+              "command": "git add hello-entire.md && git commit -m \"Add hello-entire.md checkpoint note\""
+            },
+            "time": {
+              "start": 1785003578403
+            }
+          },
+          "id": "prt_f9a8112ca001IF3yBKyBnXRQ6w",
+          "sessionID": "ses_0657fb80affelxzJWmuphHdR1e",
+          "messageID": "msg_f9a8109f3001T4LODqkIkyHupV"
+        }
+      ]
+    }
+  ]
+}
