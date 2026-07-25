@@ -1354,9 +1354,13 @@ The demo's value isn't the custom control plane — it's the **end-to-end identi
 ├── scripts/
 │   ├── gen_keys.py              # RS256 keypair
 │   └── seed_passwords.py        # BCrypt hash helper
+├── .entire/                     # Entire configuration (settings, hooks, session metadata)
+│   ├── settings.json            # commit_linking=always, enabled=true
+│   └── logs/, metadata/, tmp/
+├── .opencode/                   # opencode agent configuration
 └── docs/
     ├── ARCHITECTURE.md          # This file
-    └── RUNBOOK.md               # Setup + demo walkthrough
+    └── RUNBOOK.md               # Setup + demo walkthrough (includes Entire checkpoint setup in §13)
 
 └── tests/                       # pytest suite (run via `make test`)
     ├── conftest.py              # Shared fixtures (stack-up wait, DB connection helper)

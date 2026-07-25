@@ -537,3 +537,59 @@ SELECT ts, principal, role, tool_name, tool_ok
 FROM platform.llm_log
 ORDER BY ts DESC LIMIT 20;
 ```
+
+## 13. Entire Checkpoint Capture
+
+This repo uses [Entire](https://entire.io) to capture session context (prompts, transcripts, changed files, token usage) and link it to Git commits as checkpoints. Every commit made via an Entire-enabled agent gets an `Entire-Checkpoint` trailer, and checkpoint metadata is stored on the `entire/checkpoints/v1` branch.
+
+### Setup
+
+Entire is already enabled in this repo with the `opencode` agent. Confirm:
+
+```bash
+entire agent list   # ✓ opencode should be active
+```
+
+`.entire/settings.json` has `"commit_linking": "always"`, so any commit from an agent session automatically links to a checkpoint without prompting.
+
+### How it works
+
+1. Agent hooks in `.entire/` capture session context (prompt, transcript, tool calls).
+2. Git hooks (`prepare-commit-msg`, `post-commit`) in `.git/hooks/` add an `Entire-Checkpoint` trailer to the commit and condense session data.
+3. Checkpoint metadata is pushed to the `entire/checkpoints/v1` branch.
+
+### Useful commands
+
+```bash
+# List checkpoints on the current branch
+entire checkpoint list
+
+# View session details, changed files, and transcript
+entire checkpoint explain <checkpoint-id>
+
+# Generate an AI summary (costs LLM tokens)
+entire explain --generate <checkpoint-id>
+
+# See token usage and optimization tips
+entire checkpoint tokens <checkpoint-id>
+
+# View in the web UI
+entire open
+```
+
+### Pushing checkpoints
+
+The `entire/checkpoints/v1` branch is the canonical store for checkpoint metadata. Push it alongside your working branch:
+
+```bash
+git push origin main
+git push origin entire/checkpoints/v1
+```
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| No `Entire-Checkpoint` trailer on commit | Entire hooks not installed | Run `entire enable --agent opencode` |
+| `entire checkpoint list` empty | Checkpoint metadata not pushed | `git push origin entire/checkpoints/v1` |
+| `entire` command not found | CLI not installed | `brew install entire` (or follow https://docs.entire.io) |
