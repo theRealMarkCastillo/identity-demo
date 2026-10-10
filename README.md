@@ -39,3 +39,13 @@ This demo proves you can have:
 - **RLS as the last line of defense** at the row level
 - **Column-level masking** as the next line — PII cells never reach an agent, even with raw scopes
 - **Full audit trail** of who attempted what and what happened, with `unmask_access` rows for compliance
+
+## Local configuration and generated files
+
+The following files are local-only and ignored by Git:
+
+- `.entire/settings.json`
+
+Before pulling the commit that untracks them, back up any configured copies
+outside the checkout. Git may remove the formerly tracked files during the
+update; restore your copies afterward. Do not force-add them.

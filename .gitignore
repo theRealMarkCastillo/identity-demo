@@ -87,3 +87,9 @@ test.sqlite
 # is tracked but the install tree is not.
 node_modules/
 scripts/node_modules/
+
+# Keep machine-specific configuration and generated local artifacts out of Git.
+/.agents/*.json
+/.claude/*.json
+/.codex/*.json
+/.entire/*.json
